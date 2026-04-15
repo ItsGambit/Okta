@@ -9,6 +9,14 @@
 #   The agent (sftd) enables Okta Privileged Access Management on the host,
 #   allowing just-in-time SSH/RDP access under policy control.
 #
+#   On startup the script checks for an existing installation.  If the agent
+#   is already present it stops the service, displays the installed version
+#   and last-known status, then offers a menu:
+#     [a] Exit       — leave the stopped service alone and quit
+#     [b] Restart    — start the existing agent and quit
+#     [c] Reinstall  — purge the agent and run a full fresh installation
+#                      (a new or existing enrollment token is required)
+#
 #   Supports both interactive (prompts for enrollment token) and non-interactive
 #   (token via --token flag) installation modes.
 #
@@ -834,6 +842,322 @@ print_summary() {
 }
 
 # =============================================================================
+# EXISTING INSTALLATION MANAGEMENT
+# =============================================================================
+
+# Return 0 (true) when the PAA package is currently installed, 1 otherwise.
+# Uses PKG_MANAGER set by detect_distro().
+_is_package_installed() {
+    case "$PKG_MANAGER" in
+        apt)
+            dpkg -l "$PACKAGE_NAME" 2>/dev/null | grep -qE "^ii"
+            ;;
+        rpm)
+            rpm -q "$PACKAGE_NAME" &>/dev/null
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Print the installed package version to stdout.
+_get_installed_version() {
+    local version=""
+    case "$PKG_MANAGER" in
+        apt)
+            version="$(dpkg -l "$PACKAGE_NAME" 2>/dev/null \
+                | awk '/^ii/ {print $3}' \
+                | head -1)"
+            ;;
+        rpm)
+            version="$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' \
+                "$PACKAGE_NAME" 2>/dev/null || true)"
+            ;;
+    esac
+    echo "${version:-unknown}"
+}
+
+# Start the already-installed agent, display the new service status, and exit.
+# Called when the user selects option [b] from the management menu.
+_restart_existing_service() {
+    log_step "Restarting service: ${SERVICE_NAME}"
+
+    systemctl start "$SERVICE_NAME" >> "$LOG_FILE" 2>&1 \
+        || die "Failed to start ${SERVICE_NAME}. Check: systemctl status ${SERVICE_NAME}"
+
+    # Brief pause to let the service settle into a stable state
+    sleep 2
+
+    local new_status
+    new_status="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo "inactive")"
+
+    log_info "Service restart complete. Status: ${new_status}"
+
+    echo ""
+    echo "================================================================="
+    echo "  Restart Complete"
+    echo "================================================================="
+    printf "  Service  :  %s\n" "$SERVICE_NAME"
+    printf "  Status   :  %s\n" "$new_status"
+    echo ""
+    echo "  Useful commands:"
+    echo "    Check status  :  systemctl status ${SERVICE_NAME}"
+    echo "    View logs     :  journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+    echo "================================================================="
+    echo ""
+}
+
+# Ask the user to type 'yes' before proceeding with the destructive reinstall.
+# Returns 0 when confirmed, 1 when cancelled (so callers can use 'if').
+_confirm_reinstall() {
+    echo ""
+    echo "================================================================="
+    echo "  !! WARNING — Uninstall and Reinstall"
+    echo "================================================================="
+    echo ""
+    echo "  This action will:"
+    echo "    • Stop and completely remove the ${PACKAGE_NAME} package"
+    echo "    • Delete the agent configuration file  (${CONFIG_FILE})"
+    echo "    • Remove any pending token file        (${TOKEN_FILE})"
+    echo "    • De-enroll this server from Okta Privileged Access"
+    echo ""
+    echo "  An enrollment token is required to re-enroll this server."
+    echo "  You may use:"
+    echo "    • A NEW token generated from the Okta PAM console, OR"
+    echo "    • An EXISTING unused token previously issued for this server"
+    echo ""
+    echo "  Where to get a token:"
+    echo "    Okta PAM console → Resources → Servers → Enroll Server"
+    echo ""
+    echo "================================================================="
+
+    while true; do
+        read -rp "  Type 'yes' to confirm reinstall, or 'no' to cancel: " confirm
+        case "${confirm,,}" in
+            yes)
+                log_info "User confirmed reinstall."
+                return 0
+                ;;
+            no)
+                log_info "User cancelled reinstall."
+                echo ""
+                echo "  Reinstall cancelled. Returning to menu."
+                return 1
+                ;;
+            *)
+                echo "  Please type 'yes' to confirm or 'no' to cancel."
+                ;;
+        esac
+    done
+}
+
+# Display the management menu and act on the user's choice.
+#   [a] Exit       — quit the script (service remains stopped)
+#   [b] Restart    — start the service and quit
+#   [c] Reinstall  — confirm, then uninstall; returns 0 so caller continues
+#                    with the full fresh-install flow
+_show_existing_install_menu() {
+    while true; do
+        echo ""
+        echo "  What would you like to do?"
+        echo ""
+        echo "    [a]  Exit the script"
+        echo "         (the ${SERVICE_NAME} service will remain stopped)"
+        echo ""
+        echo "    [b]  Restart the agent"
+        echo "         (start ${SERVICE_NAME} and exit)"
+        echo ""
+        echo "    [c]  Uninstall and reinstall"
+        echo "         !! Requires a new or existing enrollment token"
+        echo "            from the Okta PAM console (Resources > Servers)"
+        echo ""
+        read -rp "  Enter choice [a/b/c]: " menu_choice
+
+        case "${menu_choice,,}" in
+            a)
+                log_info "User chose: exit."
+                echo ""
+                echo "  Exiting. The ${SERVICE_NAME} service remains stopped."
+                echo "  To restart it manually:  systemctl start ${SERVICE_NAME}"
+                echo ""
+                exit "$EXIT_SUCCESS"
+                ;;
+            b)
+                log_info "User chose: restart agent."
+                _restart_existing_service
+                exit "$EXIT_SUCCESS"
+                ;;
+            c)
+                log_info "User chose: uninstall and reinstall."
+                # Use 'if' so set -e does not trap the non-zero return from
+                # _confirm_reinstall when the user types 'no'.
+                if _confirm_reinstall; then
+                    return 0   # Caller should proceed with the reinstall flow
+                fi
+                # User typed 'no' — loop and show the menu again
+                ;;
+            *)
+                echo "  Invalid choice '${menu_choice}'. Please enter a, b, or c."
+                log_debug "Invalid menu input received: '${menu_choice}'"
+                ;;
+        esac
+    done
+}
+
+# Remove the package and clean up files in preparation for a clean reinstall.
+uninstall_package() {
+    log_step "Uninstalling ${PACKAGE_NAME}"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would stop and disable : ${SERVICE_NAME}"
+        log_info "[DRY RUN] Would purge package    : ${PACKAGE_NAME}"
+        log_info "[DRY RUN] Would remove config    : ${CONFIG_FILE}"
+        log_info "[DRY RUN] Would remove token     : ${TOKEN_FILE} (if present)"
+        return
+    fi
+
+    # Stop the service (may already be stopped; || true prevents set -e exit)
+    log_info "Stopping service: ${SERVICE_NAME}"
+    systemctl stop "$SERVICE_NAME" >> "$LOG_FILE" 2>&1 || true
+
+    # Disable so it does not start again if the purge is interrupted
+    log_info "Disabling service: ${SERVICE_NAME}"
+    systemctl disable "$SERVICE_NAME" >> "$LOG_FILE" 2>&1 || true
+
+    # Remove the package
+    case "$PKG_MANAGER" in
+        apt)
+            log_info "Purging package via apt-get: ${PACKAGE_NAME}"
+            DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y "$PACKAGE_NAME" \
+                >> "$LOG_FILE" 2>&1 \
+                || die "apt-get remove --purge failed for '${PACKAGE_NAME}'. See: ${LOG_FILE}"
+            ;;
+        rpm)
+            if command -v dnf &>/dev/null; then
+                log_info "Removing package via dnf: ${PACKAGE_NAME}"
+                dnf remove -y "$PACKAGE_NAME" >> "$LOG_FILE" 2>&1 \
+                    || die "dnf remove failed for '${PACKAGE_NAME}'. See: ${LOG_FILE}"
+            else
+                log_info "Removing package via yum: ${PACKAGE_NAME}"
+                yum remove -y "$PACKAGE_NAME" >> "$LOG_FILE" 2>&1 \
+                    || die "yum remove failed for '${PACKAGE_NAME}'. See: ${LOG_FILE}"
+            fi
+            ;;
+        *)
+            die "Unknown package manager: '${PKG_MANAGER}'"
+            ;;
+    esac
+
+    log_info "Package removed: ${PACKAGE_NAME}"
+
+    # Remove configuration and token files that the package manager's own purge
+    # step may not clean up (they live outside the package's declared file list).
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log_info "Removing configuration file: ${CONFIG_FILE}"
+        rm -f "$CONFIG_FILE" \
+            || log_warn "Could not remove config file: ${CONFIG_FILE}"
+    fi
+
+    if [[ -f "$TOKEN_FILE" ]]; then
+        log_info "Removing stale token file: ${TOKEN_FILE}"
+        rm -f "$TOKEN_FILE" \
+            || log_warn "Could not remove token file: ${TOKEN_FILE}"
+    fi
+
+    log_info "Uninstall complete."
+    echo ""
+    echo "  Package removed. Proceeding with fresh installation..."
+    echo ""
+}
+
+# Top-level check run early in main().
+# If the PAA is NOT installed → returns immediately (proceed with fresh install).
+# If the PAA IS installed    → stops the service, reports version and status,
+#                              then presents the management menu.
+#   Menu option [a] or [b] will exit the script directly from inside this function.
+#   Menu option [c] will call uninstall_package() and then return 0, allowing
+#   the caller to continue with the full installation flow.
+check_existing_installation() {
+    log_step "Checking for existing installation"
+
+    # No package found — nothing to do here
+    if ! _is_package_installed; then
+        log_info "No existing ${PACKAGE_NAME} installation found. Proceeding with fresh install."
+        return 0
+    fi
+
+    # -------------------------------------------------------------------------
+    # Package is installed — gather information before touching anything
+    # -------------------------------------------------------------------------
+    local installed_version
+    installed_version="$(_get_installed_version)"
+
+    # Capture the pre-stop service state for the display panel
+    local svc_active svc_sub svc_display
+    svc_active="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo "inactive")"
+    svc_sub="$(systemctl show -p SubState --value "$SERVICE_NAME" 2>/dev/null || echo "")"
+
+    # Build a readable "active (running)" or "inactive (dead)" style string
+    if [[ -n "$svc_sub" && "$svc_sub" != "$svc_active" ]]; then
+        svc_display="${svc_active} (${svc_sub})"
+    else
+        svc_display="${svc_active}"
+    fi
+
+    log_info "Existing installation detected."
+    log_info "  Installed version : ${installed_version}"
+    log_info "  Service status    : ${svc_display}"
+
+    # Stop the service now, before any further action
+    log_info "Stopping ${SERVICE_NAME} before proceeding..."
+    if [[ "$DRY_RUN" == "false" ]]; then
+        systemctl stop "$SERVICE_NAME" >> "$LOG_FILE" 2>&1 || true
+        log_info "Service stopped."
+    fi
+
+    # -------------------------------------------------------------------------
+    # Display the existing-installation summary panel
+    # -------------------------------------------------------------------------
+    echo ""
+    echo "================================================================="
+    echo "  Okta Privileged Access Agent — Already Installed"
+    echo "================================================================="
+    printf "  Installed version : %s\n" "$installed_version"
+    printf "  Service status    : %s\n" "$svc_display"
+    echo "  (service has been stopped)"
+    echo "================================================================="
+
+    # -------------------------------------------------------------------------
+    # Handle non-interactive / dry-run cases without blocking on stdin
+    # -------------------------------------------------------------------------
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would present management menu [a/b/c]."
+        log_info "[DRY RUN] Continuing install simulation."
+        return 0
+    fi
+
+    # If stdin is not a terminal (piped/automated run) we cannot show an
+    # interactive menu — exit cleanly rather than hanging indefinitely.
+    if [[ ! -t 0 ]]; then
+        log_warn "Non-interactive session detected; cannot display management menu."
+        log_warn "Exiting without changes. Run the script in an interactive terminal"
+        log_warn "to restart, reinstall, or otherwise manage the existing installation."
+        exit "$EXIT_SUCCESS"
+    fi
+
+    # -------------------------------------------------------------------------
+    # Show the interactive management menu
+    # -------------------------------------------------------------------------
+    # Returns 0 when the user chooses [c] and confirms reinstall.
+    # Options [a] and [b] call exit() directly, so we only return here for [c].
+    _show_existing_install_menu
+
+    # User chose [c] and confirmed — run the uninstall before the install flow
+    uninstall_package
+}
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -860,32 +1184,39 @@ main() {
     # 3. Detect the Linux distribution and choose the package manager
     detect_distro
 
-    # 4. Add the official Okta package repository and GPG key
+    # 4. Check for an existing agent installation.
+    #    If found: stops the service, shows version + status, presents menu.
+    #    Exits here if user chooses [a] exit or [b] restart.
+    #    Uninstalls and falls through if user chooses [c] reinstall.
+    #    Returns immediately (no-op) if the agent is not installed.
+    check_existing_installation
+
+    # 5. Add the official Okta package repository and GPG key
     case "$PKG_MANAGER" in
         apt) setup_apt_repo ;;
         rpm) setup_rpm_repo ;;
         *)   die "Unsupported package manager: '${PKG_MANAGER}'" ;;
     esac
 
-    # 5. Install the scaleft-server-tools package
+    # 6. Install the scaleft-server-tools package
     install_package
 
-    # 6. Obtain the enrollment token (interactively or from --token flag)
+    # 7. Obtain the enrollment token (interactively or from --token flag)
     prompt_for_token
 
-    # 7. Write the enrollment token to disk at the expected path
+    # 8. Write the enrollment token to disk at the expected path
     configure_enrollment_token
 
-    # 8. Create a minimal /etc/sft/sftd.yaml configuration file
+    # 9. Create a minimal /etc/sft/sftd.yaml configuration file
     configure_agent
 
-    # 9. Enable and start the sftd systemd service
+    # 10. Enable and start the sftd systemd service
     enable_and_start_service
 
-    # 10. Run post-install checks and report status
+    # 11. Run post-install checks and report status
     verify_installation
 
-    # 11. Print a human-readable summary with useful commands
+    # 12. Print a human-readable summary with useful commands
     print_summary
 
     log_info "${SCRIPT_NAME} finished successfully."
