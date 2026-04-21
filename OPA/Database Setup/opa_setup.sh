@@ -28,7 +28,7 @@ IFS=$'\n\t'
 # SECTION 1 – Global variables, constants, and logging bootstrap
 # ---------------------------------------------------------------------------
 
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.0.5"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 readonly LOG_DIR="/var/log/opa-setup"
@@ -62,6 +62,12 @@ INSTALL_POSTGRESQL=0
 NON_INTERACTIVE=0
 SKIP_UPDATES=0
 FORCE_REINSTALL=0
+
+# Rollback tracking – set to 1 when an install begins so the EXIT trap can undo it
+ROLLBACK_AGENT=0
+ROLLBACK_GATEWAY=0
+ROLLBACK_MYSQL=0
+ROLLBACK_POSTGRESQL=0
 
 # Sample-data row count (only relevant when installing a SQL server)
 SAMPLE_DATA_ROWS=0   # 0 = ask at runtime
@@ -115,6 +121,33 @@ die() {
 }
 
 separator() { log INFO "------------------------------------------------------------"; }
+
+# Called automatically on exit via trap.  Only performs rollback when the
+# exit code is non-zero (i.e. something failed).
+rollback_on_error() {
+    local exit_code="${1:-1}"
+    trap - EXIT   # prevent recursive invocation
+    set +e        # prevent set -e from aborting rollback mid-way
+    if [[ "${exit_code}" -ne 0 ]]; then
+        log ERROR "Installation failed (exit ${exit_code}). Rolling back changes..."
+        if [[ "${ROLLBACK_POSTGRESQL}" == "1" ]]; then
+            uninstall_postgresql 2>&1 | tee -a "${LOG_FILE}" || log WARN "PostgreSQL rollback failed."
+        fi
+        if [[ "${ROLLBACK_MYSQL}" == "1" ]]; then
+            uninstall_mysql 2>&1 | tee -a "${LOG_FILE}" || log WARN "MySQL rollback failed."
+        fi
+        if [[ "${ROLLBACK_AGENT}" == "1" ]]; then
+            uninstall_component "OPA Agent" "${OPA_AGENT_SERVICE}" "${OPA_AGENT_SERVICE}" \
+                2>&1 | tee -a "${LOG_FILE}" || log WARN "OPA Agent rollback failed."
+        fi
+        if [[ "${ROLLBACK_GATEWAY}" == "1" ]]; then
+            uninstall_component "OPA Gateway" "${OPA_GATEWAY_SERVICE}" "${OPA_GATEWAY_SERVICE}" \
+                2>&1 | tee -a "${LOG_FILE}" || log WARN "OPA Gateway rollback failed."
+        fi
+        log INFO "Rollback complete. See ${LOG_FILE} for details."
+    fi
+    exit "${exit_code}"
+}
 
 # Run a command, logging it and its output.  Exits on failure unless the
 # caller passes  || true  to suppress.
@@ -455,7 +488,9 @@ get_installed_version() {
 
 get_service_status() {
     local svc="${1}"
-    systemctl is-active "${svc}" 2>/dev/null || echo "inactive/not-found"
+    local status
+    status="$(systemctl is-active "${svc}" 2>/dev/null)" || status="inactive/not-found"
+    echo "${status}"
 }
 
 print_component_status() {
@@ -548,6 +583,11 @@ check_already_installed() {
     is_installed "mysqld"                      && mysql_installed=1
     is_installed "postgresql"                  && pgsql_installed=1
     is_installed "postgresql-server"           && pgsql_installed=1
+    # Detect versioned PGDG packages (e.g. postgresql-16 installed from pgdg repo)
+    case "${PKG_MGR}" in
+        apt)     dpkg -l 'postgresql-[0-9]*' 2>/dev/null | grep -q '^ii' && pgsql_installed=1 || true ;;
+        dnf|yum) rpm -qa 2>/dev/null | grep -q '^postgresql[0-9]*-server' && pgsql_installed=1 || true ;;
+    esac
 
     # ----- OPA Agent -----
     if [[ "${agent_installed}" == "1" ]] && [[ "${INSTALL_AGENT}" == "1" || "${NON_INTERACTIVE}" == "0" ]]; then
@@ -750,6 +790,7 @@ add_opa_repo() {
 # ---------------------------------------------------------------------------
 
 install_opa_agent() {
+    ROLLBACK_AGENT=1
     separator
     log INFO "Installing Okta Privilege Access Agent..."
 
@@ -845,6 +886,7 @@ EOF
 # ---------------------------------------------------------------------------
 
 install_opa_gateway() {
+    ROLLBACK_GATEWAY=1
     separator
     log INFO "Installing Okta Privilege Access Gateway..."
 
@@ -963,6 +1005,7 @@ uninstall_mysql() {
 }
 
 install_mysql() {
+    ROLLBACK_MYSQL=1
     separator
     log INFO "Installing MySQL Server..."
 
@@ -1040,7 +1083,7 @@ setup_mysql() {
 
     # Set root password and apply mysql_secure_installation steps non-interactively.
     # Reference: https://dev.mysql.com/doc/refman/8.0/en/mysql-secure-installation.html
-    mysql --user=root "${mysql_initial_args[@]}" <<-SQL_EOF
+    mysql --user=root "${mysql_initial_args[@]+"${mysql_initial_args[@]}"}" <<-SQL_EOF
         -- Set root password with caching_sha2_password (MySQL 8 default)
         ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY '${MYSQL_ROOT_PASSWORD}';
 
@@ -1228,6 +1271,7 @@ uninstall_postgresql() {
 }
 
 install_postgresql() {
+    ROLLBACK_POSTGRESQL=1
     separator
     log INFO "Installing PostgreSQL Server..."
 
@@ -1496,7 +1540,102 @@ PSQL_EOF
 }
 
 # ---------------------------------------------------------------------------
-# SECTION 14 – Sample-data row count helper
+# SECTION 14 – Firewall configuration
+# ---------------------------------------------------------------------------
+# Port reference: https://help.okta.com/en-us/content/topics/privileged-access/pam-default-ports.htm
+# ---------------------------------------------------------------------------
+
+configure_firewall() {
+    log INFO "Configuring firewall rules for installed OPA components..."
+
+    # Detect available firewall manager
+    local fw=""
+    if command -v ufw &>/dev/null; then
+        fw="ufw"
+    elif command -v firewall-cmd &>/dev/null; then
+        fw="firewalld"
+    else
+        log WARN "No supported firewall manager (ufw/firewalld) found. Open the following ports manually:"
+        [[ "${INSTALL_AGENT}"   == "1" ]] && log WARN "  TCP 22    inbound  – OPA Agent: SSH"
+        [[ "${INSTALL_AGENT}"   == "1" ]] && log WARN "  TCP 4421  inbound  – OPA Agent: on-demand user provisioning"
+        [[ "${INSTALL_AGENT}"   == "1" ]] && log WARN "  TCP 443   outbound – OPA Agent: Okta platform"
+        [[ "${INSTALL_GATEWAY}" == "1" ]] && log WARN "  TCP 7234  inbound  – OPA Gateway: client connections"
+        [[ "${INSTALL_GATEWAY}" == "1" ]] && log WARN "  TCP 443   outbound – OPA Gateway: Okta platform"
+        return
+    fi
+
+    # Open a single TCP port
+    open_tcp_port() {
+        local port="${1}"
+        local label="${2}"
+        case "${fw}" in
+            ufw)
+                ufw allow "${port}/tcp" comment "${label}" \
+                    || log WARN "ufw: failed to open ${port}/tcp (${label})."
+                ;;
+            firewalld)
+                if systemctl is-active --quiet firewalld 2>/dev/null; then
+                    firewall-cmd --permanent --add-port="${port}/tcp" \
+                        || log WARN "firewalld: failed to open ${port}/tcp (${label})."
+                else
+                    log WARN "firewalld is not running; start it then run: firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload"
+                fi
+                ;;
+        esac
+        log SUCCESS "Firewall: opened ${port}/TCP – ${label}"
+    }
+
+    # Always keep SSH open before enabling ufw to avoid locking out the session
+    open_tcp_port "22" "SSH"
+
+    # OPA Server Agent
+    # Ref: https://help.okta.com/en-us/content/topics/privileged-access/pam-default-ports.htm
+    if [[ "${INSTALL_AGENT}" == "1" ]]; then
+        # 22/TCP inbound  – SSH connections to this server
+        # 4421/TCP inbound – on-demand user provisioning (also RDP proxy on Windows)
+        # 443/TCP outbound – connections to Okta platform (allowed by default; no inbound rule needed)
+        open_tcp_port "4421" "OPA Agent: on-demand user provisioning"
+        log INFO "Firewall: TCP 443 outbound (OPA Agent → Okta) must be permitted; outbound is allowed by default."
+    fi
+
+    # OPA Gateway
+    # Ref: https://help.okta.com/en-us/content/topics/privileged-access/pam-default-ports.htm
+    if [[ "${INSTALL_GATEWAY}" == "1" ]]; then
+        # 7234/TCP inbound  – incoming connections from the OPA client
+        # 443/TCP  outbound – connections to Okta platform and cloud storage (allowed by default)
+        open_tcp_port "7234" "OPA Gateway: client connections"
+        log INFO "Firewall: TCP 443 outbound (OPA Gateway → Okta) must be permitted; outbound is allowed by default."
+    fi
+
+    # MySQL – bound to 127.0.0.1 in this setup; no external port needed
+    if [[ "${INSTALL_MYSQL}" == "1" ]]; then
+        log INFO "Firewall: MySQL is bound to 127.0.0.1:3306 – no external firewall rule required."
+    fi
+
+    # PostgreSQL – bound to localhost in this setup; no external port needed
+    if [[ "${INSTALL_POSTGRESQL}" == "1" ]]; then
+        log INFO "Firewall: PostgreSQL is bound to localhost:5432 – no external firewall rule required."
+    fi
+
+    # Apply / reload rules
+    case "${fw}" in
+        ufw)
+            if ufw status 2>&1 | grep -q "Status: active"; then
+                ufw reload || log WARN "ufw: failed to reload."
+            else
+                ufw --force enable || log WARN "ufw: failed to enable."
+            fi
+            ;;
+        firewalld)
+            firewall-cmd --reload || log WARN "firewalld: failed to reload."
+            ;;
+    esac
+
+    log SUCCESS "Firewall configuration complete."
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 15 – Sample-data row count helper
 # ---------------------------------------------------------------------------
 
 get_sample_data_rows() {
@@ -1531,7 +1670,7 @@ get_sample_data_rows() {
 }
 
 # ---------------------------------------------------------------------------
-# SECTION 15 – Credentials file and final summary
+# SECTION 16 – Credentials file and final summary
 # ---------------------------------------------------------------------------
 
 initialise_credentials_file() {
@@ -1584,7 +1723,7 @@ print_summary() {
 }
 
 # ---------------------------------------------------------------------------
-# SECTION 16 – Root / privilege check
+# SECTION 17 – Root / privilege check
 # ---------------------------------------------------------------------------
 
 check_root() {
@@ -1594,12 +1733,15 @@ check_root() {
 }
 
 # ---------------------------------------------------------------------------
-# SECTION 17 – Main execution
+# SECTION 18 – Main execution
 # ---------------------------------------------------------------------------
 
 main() {
     # Parse CLI arguments first so flags affect all subsequent steps
     parse_args "$@"
+
+    # Register rollback trap – fires on any non-zero exit
+    trap 'rollback_on_error $?' EXIT
 
     separator
     log INFO "Okta Privilege Access Setup Script v${SCRIPT_VERSION}"
@@ -1638,7 +1780,10 @@ main() {
     [[ "${INSTALL_MYSQL}"      == "1" ]] && install_mysql
     [[ "${INSTALL_POSTGRESQL}" == "1" ]] && install_postgresql
 
-    # Step 6: Print final summary and credentials location
+    # Step 6: Open required firewall ports
+    configure_firewall
+
+    # Step 7: Print final summary and credentials location
     print_summary
 }
 
