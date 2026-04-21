@@ -1425,7 +1425,7 @@ local   all             all                             scram-sha-256
 host    all             all             127.0.0.1/32    scram-sha-256
 host    all             all             ::1/128         scram-sha-256
 EOF
-        cp "${hba_conf}" "${hba_conf}.bak_${TIMESTAMP}"
+        [[ -f "${hba_conf}" ]] && cp "${hba_conf}" "${hba_conf}.bak_${TIMESTAMP}"
         mv "${tmp_hba}" "${hba_conf}"
         chown postgres:postgres "${hba_conf}"
         chmod 600 "${hba_conf}"
