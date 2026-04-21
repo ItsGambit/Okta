@@ -28,7 +28,7 @@ IFS=$'\n\t'
 # SECTION 1 – Global variables, constants, and logging bootstrap
 # ---------------------------------------------------------------------------
 
-readonly SCRIPT_VERSION="1.0.5"
+readonly SCRIPT_VERSION="1.0.6"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 readonly LOG_DIR="/var/log/opa-setup"
@@ -737,11 +737,35 @@ add_opa_repo_deb() {
 
     local keyring="/usr/share/keyrings/okta-pam-agent.gpg"
     local sources_file="/etc/apt/sources.list.d/okta-pam-agent.list"
+    local tmp_key
+    tmp_key="$(mktemp)"
 
-    # Import GPG key
-    curl -fsSL "${OPA_REPO_GPG_URL}" \
-        | gpg --dearmor -o "${keyring}" \
-        || die "Failed to import Okta PAM GPG key."
+    # Download the GPG key to a temp file so curl errors are caught separately
+    # from the dearmor step.
+    log INFO "Downloading Okta PAM GPG key from ${OPA_REPO_GPG_URL}..."
+    curl -fsSL --connect-timeout 30 --retry 3 --retry-delay 5 \
+        -o "${tmp_key}" "${OPA_REPO_GPG_URL}" \
+        || { rm -f "${tmp_key}"; die "Failed to download Okta PAM GPG key (curl error). Check network connectivity and that ${OPA_REPO_GPG_URL} is reachable."; }
+
+    if [[ ! -s "${tmp_key}" ]]; then
+        rm -f "${tmp_key}"
+        die "Okta PAM GPG key file is empty. The URL may have changed – verify at https://help.okta.com/pam/en-us/"
+    fi
+
+    # The key may be ASCII-armored (begins with '-----BEGIN') or already binary.
+    # gpg --dearmor only accepts ASCII-armored input; for a binary key we copy it
+    # directly.  Using 'file' or checking the first bytes is the most reliable way.
+    if head -c 27 "${tmp_key}" | grep -q "BEGIN PGP"; then
+        log DEBUG "GPG key is ASCII-armored; running gpg --dearmor."
+        gpg --batch --yes --dearmor -o "${keyring}" "${tmp_key}" \
+            || { rm -f "${tmp_key}"; die "Failed to import Okta PAM GPG key (gpg --dearmor failed)."; }
+    else
+        log DEBUG "GPG key is already in binary format; copying directly."
+        cp "${tmp_key}" "${keyring}" \
+            || { rm -f "${tmp_key}"; die "Failed to copy Okta PAM GPG key to ${keyring}."; }
+    fi
+    rm -f "${tmp_key}"
+    chmod 644 "${keyring}"
 
     # Add repository
     echo "deb [arch=$(dpkg --print-architecture) signed-by=${keyring}] ${OPA_REPO_DEB_URL} stable main" \
@@ -761,9 +785,23 @@ add_opa_repo_rpm() {
     local basearch
     basearch="$(uname -m)"
 
-    # Import GPG key
-    rpm --import "${OPA_REPO_GPG_URL}" \
-        || die "Failed to import Okta PAM GPG key."
+    # Download and import GPG key. curl is used first so network errors are
+    # caught with a clear message before rpm --import is invoked.
+    local tmp_key
+    tmp_key="$(mktemp)"
+    log INFO "Downloading Okta PAM GPG key from ${OPA_REPO_GPG_URL}..."
+    curl -fsSL --connect-timeout 30 --retry 3 --retry-delay 5 \
+        -o "${tmp_key}" "${OPA_REPO_GPG_URL}" \
+        || { rm -f "${tmp_key}"; die "Failed to download Okta PAM GPG key (curl error). Check network connectivity and that ${OPA_REPO_GPG_URL} is reachable."; }
+
+    if [[ ! -s "${tmp_key}" ]]; then
+        rm -f "${tmp_key}"
+        die "Okta PAM GPG key file is empty. The URL may have changed – verify at https://help.okta.com/pam/en-us/"
+    fi
+
+    rpm --import "${tmp_key}" \
+        || { rm -f "${tmp_key}"; die "Failed to import Okta PAM GPG key (rpm --import failed)."; }
+    rm -f "${tmp_key}"
 
     # Write repo file
     cat > /etc/yum.repos.d/okta-pam-agent.repo <<EOF
@@ -1281,9 +1319,27 @@ install_postgresql() {
         apt)
             # Add PostgreSQL PGDG APT repository
             local pg_keyring="/usr/share/keyrings/postgresql.gpg"
-            curl -fsSL "https://www.postgresql.org/media/keys/ACCC4CF8.asc" \
-                | gpg --dearmor -o "${pg_keyring}" \
-                || die "Failed to import PostgreSQL GPG key."
+            local tmp_pg_key
+            tmp_pg_key="$(mktemp)"
+            log INFO "Downloading PostgreSQL GPG key..."
+            curl -fsSL --connect-timeout 30 --retry 3 --retry-delay 5 \
+                -o "${tmp_pg_key}" "https://www.postgresql.org/media/keys/ACCC4CF8.asc" \
+                || { rm -f "${tmp_pg_key}"; die "Failed to download PostgreSQL GPG key (curl error)."; }
+
+            if [[ ! -s "${tmp_pg_key}" ]]; then
+                rm -f "${tmp_pg_key}"
+                die "PostgreSQL GPG key file is empty."
+            fi
+
+            if head -c 27 "${tmp_pg_key}" | grep -q "BEGIN PGP"; then
+                gpg --batch --yes --dearmor -o "${pg_keyring}" "${tmp_pg_key}" \
+                    || { rm -f "${tmp_pg_key}"; die "Failed to import PostgreSQL GPG key (gpg --dearmor failed)."; }
+            else
+                cp "${tmp_pg_key}" "${pg_keyring}" \
+                    || { rm -f "${tmp_pg_key}"; die "Failed to copy PostgreSQL GPG key to ${pg_keyring}."; }
+            fi
+            rm -f "${tmp_pg_key}"
+            chmod 644 "${pg_keyring}"
 
             echo "deb [arch=$(dpkg --print-architecture) signed-by=${pg_keyring}] \
 https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \

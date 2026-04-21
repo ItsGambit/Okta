@@ -1,6 +1,6 @@
 # Okta Privilege Access (OPA) Setup Script
 
-**Version:** 1.0.5
+**Version:** 1.0.6
 **Script:** `opa_setup.sh`
 
 ---
@@ -136,7 +136,7 @@ After downloading, confirm the script version before running:
 
 ```bash
 grep 'SCRIPT_VERSION=' opa_setup.sh
-# Expected: readonly SCRIPT_VERSION="1.0.5"
+# Expected: readonly SCRIPT_VERSION="1.0.6"
 ```
 
 ---
@@ -738,6 +738,14 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ## Changelog
 
+### v1.0.6 — 2026-04-21
+- **Fix:** GPG key import rewritten for all distributions to eliminate the silent-failure `curl | gpg --dearmor` pipe pattern.
+  - **Debian/Ubuntu (`add_opa_repo_deb`):** Key is now downloaded to a temp file first so `curl` errors are caught independently. The key format is then detected — ASCII-armored keys (beginning with `-----BEGIN PGP`) are passed through `gpg --dearmor`; binary keys are copied directly to the keyring path. This resolves failures on clean installs where `packages.okta.com/okta-pam-agent/gpg` returns a binary `.gpg` file.
+  - **RHEL / CentOS / Rocky / AlmaLinux / Oracle Linux / Amazon Linux (`add_opa_repo_rpm`):** Key is now downloaded via `curl` to a temp file with timeout and retry before being passed to `rpm --import`, replacing a bare `rpm --import <url>` call that gave no meaningful error on network failure.
+  - **PostgreSQL APT repo (`install_postgresql`):** Same `curl | gpg --dearmor` pipe replaced with the same temp-file + format-detection pattern used for the Okta DEB key.
+  - All three download calls now use `--connect-timeout 30 --retry 3 --retry-delay 5` for resilience on slow or flaky networks.
+  - Keyring files are explicitly `chmod 644` after creation.
+
 ### v1.0.5 — 2026-04-21
 - **Fix:** `get_service_status` was outputting both the `systemctl is-active` status text and the fallback string `"inactive/not-found"` when a service was down, causing double-output in the captured variable. Refactored to capture first, fall back on failure.
 - **Fix:** `mysql_initial_args` empty-array expansion made safe under `set -u` using the `"${arr[@]+"${arr[@]}"}"`  guard pattern, preventing potential unbound-variable errors on older bash versions.
@@ -771,4 +779,4 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ---
 
-*Script: `opa_setup.sh` v1.0.5 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*
+*Script: `opa_setup.sh` v1.0.6 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*
