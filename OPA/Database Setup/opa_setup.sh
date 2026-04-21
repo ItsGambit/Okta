@@ -18,7 +18,7 @@
 # Usage       : sudo bash opa_setup.sh [OPTIONS]
 #               Run  sudo bash opa_setup.sh --help  for full option list.
 #
-# Version     : 1.0.0
+# Version     : 1.0.6
 # =============================================================================
 
 set -euo pipefail
