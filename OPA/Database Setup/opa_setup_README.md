@@ -1,6 +1,6 @@
 # Okta Privilege Access (OPA) Setup Script
 
-**Version:** 1.0.8
+**Version:** 1.1.1
 **Script:** `opa_setup.sh`
 
 ---
@@ -136,7 +136,7 @@ After downloading, confirm the script version before running:
 
 ```bash
 grep 'SCRIPT_VERSION=' opa_setup.sh
-# Expected: readonly SCRIPT_VERSION="1.0.8"
+# Expected: readonly SCRIPT_VERSION="1.1.1"
 ```
 
 ---
@@ -298,10 +298,11 @@ These variables are read before prompting, so pre-setting them reduces interacti
 
 **What the script does:**
 1. Adds the official Okta PAM GPG key and package repository.
-2. Installs `okta-pam-agent`.
-3. Writes a minimal YAML configuration file with your team name, enrollment token, and secure TLS settings.
-4. Enables and starts the `okta-pam-agent` systemd service.
-5. Verifies the service is running.
+2. Installs `scaleft-server-tools` (the `sftd` daemon starts automatically).
+3. Prompts for the Server Enrollment Token (created in Okta Admin > Privileged Access > Projects > \<project\> > Enrollment).
+4. Writes the token to `/var/lib/sftd/enrollment.token` — the path `sftd` reads on startup.
+5. Restarts `sftd` to apply the token.
+6. Verifies the service is running.
 
 **Post-install steps (manual):**
 - In your Okta admin console, navigate to *Security > Privileged Access > Resources* and confirm the agent appears and is marked **Active**.
@@ -325,10 +326,12 @@ https://help.okta.com/pam/en-us/content/topics/pam/agent-install.htm
 
 **What the script does:**
 1. Adds the Okta PAM repository (if not already added by the agent step).
-2. Installs `okta-pam-adserver-gateway`.
-3. Writes a YAML configuration file with your team name, gateway enrollment token, listen port, and secure TLS settings.
-4. Enables and starts the `okta-pam-adserver-gateway` systemd service.
-5. Opens port `7234/TCP` inbound via the system firewall.
+2. Installs `scaleft-gateway` (the `sftd` daemon starts automatically).
+3. Prompts for the Gateway Setup Token (created in Okta Admin > Privileged Access > Gateways > Create Token).
+4. Writes the token to `/var/lib/sft-gatewayd/setup.token` and creates `/etc/sft/sft-gatewayd.yaml` pointing to it.
+5. Restarts `sftd` to apply the configuration.
+6. Verifies the service is running.
+7. Opens port `7234/TCP` inbound via the system firewall.
 
 **Post-install steps (manual):**
 - In your Okta admin console, navigate to *Security > Privileged Access > Gateways* and confirm the gateway appears and is marked **Active**.
@@ -738,6 +741,24 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ## Changelog
 
+### v1.1.1 — 2026-04-21
+- **Fix (Critical):** `OPA_GATEWAY_SERVICE` was incorrectly set to `sftd` (same as the agent). Corrected to `sft-gatewayd` — the actual systemd service name for `scaleft-gateway` per Okta gateway documentation. This prevented gateway service management (start/stop/restart/uninstall) from working correctly and would have caused conflicts when both agent and gateway were installed on the same host.
+- **Fix:** Non-interactive mode now fails immediately with a clear error if `OPA_ENROLLMENT_TOKEN` or `OPA_GATEWAY_TOKEN` is not provided, instead of silently writing an empty token file.
+- **Fix:** Added `|| die` error handling to all token file and config file write operations (`mkdir`, `echo`, `chmod`, `cat`) in both `configure_opa_agent` and `configure_opa_gateway`.
+- **Fix:** Removed stale `OPA_TEAM=myteam` reference from the non-interactive usage example in `--help` output.
+
+### v1.1.0 — 2026-04-21
+- **Fix (Critical):** Agent and gateway configuration completely rewritten to match the actual Okta PAM enrollment model for `scaleft-server-tools` and `scaleft-gateway`.
+  - **Agent:** Removed the old `team`/`enrollmentToken` YAML config file approach. Enrollment is now done by writing the token to `/var/lib/sftd/enrollment.token` — the exact path `sftd` reads on startup per Okta docs.
+  - **Gateway:** Removed the old gateway YAML with `team`/`enrollmentToken`/`listenPort` fields. Setup token is now written to `/var/lib/sft-gatewayd/setup.token` and `/etc/sft/sft-gatewayd.yaml` is written with `SetupTokenFile` pointing to it, per Okta gateway configuration docs.
+  - Both services rely on the package installer to enable and start the daemon; the script now `restart`s rather than `enable`+`start`.
+- **Change:** Removed `OPA_TEAM` variable, `--opa-team` CLI flag, and all references — the new enrollment model does not use a team name field.
+
+### v1.0.9 — 2026-04-21
+- **Fix:** `add_opa_repo_deb` and `add_opa_repo_rpm` rewritten to follow the exact steps from the official Okta documentation instead of a custom download-and-detect approach that was causing `gpg --dearmor` failures.
+  - **Debian/Ubuntu:** Now uses `curl -fsSL <gpg-url> | gpg --dearmor | tee <keyring> > /dev/null` and `echo "deb ..." | tee <sources-list> > /dev/null` exactly as documented.
+  - **RHEL/Rocky/AlmaLinux/Amazon Linux:** Now uses `rpm --import <gpg-url>` directly as documented.
+
 ### v1.0.8 — 2026-04-21
 - **Fix (Critical):** `is_installed` was called with `OPA_AGENT_SERVICE`/`OPA_GATEWAY_SERVICE` (`sftd`) instead of the package names — it would never detect an existing agent or gateway installation. Now correctly uses `OPA_AGENT_PACKAGE` (`scaleft-server-tools`) and `OPA_GATEWAY_PACKAGE` (`scaleft-gateway`).
 - **Fix (Critical):** All calls to `uninstall_component` and `print_component_status` for Agent and Gateway — in `rollback_on_error`, `check_already_installed`, and `handle_already_installed_menu` — were passing the service name (`sftd`) as both the package and service argument. Now correctly pass the package constant for the `pkg` argument and service constant for `svc`.
@@ -800,4 +821,4 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ---
 
-*Script: `opa_setup.sh` v1.0.8 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*
+*Script: `opa_setup.sh` v1.1.1 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*

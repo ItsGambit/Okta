@@ -18,7 +18,7 @@
 # Usage       : sudo bash opa_setup.sh [OPTIONS]
 #               Run  sudo bash opa_setup.sh --help  for full option list.
 #
-# Version     : 1.0.8
+# Version     : 1.1.1
 # =============================================================================
 
 set -euo pipefail
@@ -28,7 +28,7 @@ IFS=$'\n\t'
 # SECTION 1 – Global variables, constants, and logging bootstrap
 # ---------------------------------------------------------------------------
 
-readonly SCRIPT_VERSION="1.0.8"
+readonly SCRIPT_VERSION="1.1.1"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 readonly LOG_DIR="/var/log/opa-setup"
@@ -37,7 +37,7 @@ readonly CREDS_FILE="/root/.opa_credentials_${TIMESTAMP}.txt"
 readonly OPA_AGENT_PACKAGE="scaleft-server-tools"
 readonly OPA_AGENT_SERVICE="sftd"
 readonly OPA_GATEWAY_PACKAGE="scaleft-gateway"
-readonly OPA_GATEWAY_SERVICE="sftd"
+readonly OPA_GATEWAY_SERVICE="sft-gatewayd"
 
 # Minimum required versions (update if Okta releases new minimums)
 readonly MIN_UBUNTU_VERSION="20.04"
@@ -75,7 +75,6 @@ ROLLBACK_POSTGRESQL=0
 SAMPLE_DATA_ROWS=0   # 0 = ask at runtime
 
 # Okta tenant configuration (can be pre-set via env vars or CLI)
-OPA_TEAM="${OPA_TEAM:-}"
 OPA_ENROLLMENT_TOKEN="${OPA_ENROLLMENT_TOKEN:-}"
 OPA_GATEWAY_TOKEN="${OPA_GATEWAY_TOKEN:-}"
 
@@ -284,9 +283,8 @@ INSTALL SELECTION (combine freely; at least one required in non-interactive mode
   --install-postgresql        Install PostgreSQL Server
 
 OKTA CONFIGURATION (or set matching env vars)
-  --opa-team=<TEAM>           Okta PAM team/org name       (env: OPA_TEAM)
-  --enrollment-token=<TOKEN>  Agent enrollment token        (env: OPA_ENROLLMENT_TOKEN)
-  --gateway-token=<TOKEN>     Gateway enrollment token      (env: OPA_GATEWAY_TOKEN)
+  --enrollment-token=<TOKEN>  Server enrollment token       (env: OPA_ENROLLMENT_TOKEN)
+  --gateway-token=<TOKEN>     Gateway setup token           (env: OPA_GATEWAY_TOKEN)
 
 SQL / DATABASE OPTIONS
   --sample-data-rows=<N>      Number of sample rows to seed (default: prompt)
@@ -296,7 +294,7 @@ EXAMPLES
   sudo bash ${SCRIPT_NAME}
 
   # Non-interactive: install agent + MySQL with 500 sample rows
-  sudo OPA_TEAM=myteam OPA_ENROLLMENT_TOKEN=tok_xxx \\
+  sudo OPA_ENROLLMENT_TOKEN=tok_xxx \\
     bash ${SCRIPT_NAME} --non-interactive --install-agent --install-mysql \\
     --sample-data-rows=500
 
@@ -320,7 +318,6 @@ parse_args() {
             --install-gateway)      INSTALL_GATEWAY=1 ;;
             --install-mysql)        INSTALL_MYSQL=1 ;;
             --install-postgresql)   INSTALL_POSTGRESQL=1 ;;
-            --opa-team=*)           OPA_TEAM="${arg#*=}" ;;
             --enrollment-token=*)   OPA_ENROLLMENT_TOKEN="${arg#*=}" ;;
             --gateway-token=*)      OPA_GATEWAY_TOKEN="${arg#*=}" ;;
             --sample-data-rows=*)   SAMPLE_DATA_ROWS="${arg#*=}" ;;
@@ -738,45 +735,22 @@ readonly OPA_REPO_RPM_BASE_URL="https://dist.scaleft.com/repos/rpm/stable"
 add_opa_repo_deb() {
     log INFO "Adding Okta PAM APT repository..."
 
-    local keyring="/usr/share/keyrings/oktapam-2023-archive-keyring.gpg"
-    local sources_file="/etc/apt/sources.list.d/oktapam-stable.list"
-    local tmp_key
-    tmp_key="$(mktemp)"
-
-    # Download the GPG key to a temp file so curl errors are caught separately
-    # from the dearmor step.
-    log INFO "Downloading Okta PAM GPG key from ${OPA_REPO_GPG_URL}..."
-    curl -fsSL --connect-timeout 30 --retry 3 --retry-delay 5 \
-        -o "${tmp_key}" "${OPA_REPO_GPG_URL}" \
-        || { rm -f "${tmp_key}"; die "Failed to download Okta PAM GPG key (curl error). Check network connectivity and that ${OPA_REPO_GPG_URL} is reachable."; }
-
-    if [[ ! -s "${tmp_key}" ]]; then
-        rm -f "${tmp_key}"
-        die "Okta PAM GPG key file is empty. The URL may have changed – verify at https://help.okta.com/pam/en-us/"
-    fi
-
-    # The key may be ASCII-armored (begins with '-----BEGIN') or already binary.
-    # gpg --dearmor only accepts ASCII-armored input; for a binary key we copy it
-    # directly.  Using 'file' or checking the first bytes is the most reliable way.
-    if head -c 27 "${tmp_key}" | grep -q "BEGIN PGP"; then
-        log DEBUG "GPG key is ASCII-armored; running gpg --dearmor."
-        gpg --batch --yes --dearmor -o "${keyring}" "${tmp_key}" \
-            || { rm -f "${tmp_key}"; die "Failed to import Okta PAM GPG key (gpg --dearmor failed)."; }
-    else
-        log DEBUG "GPG key is already in binary format; copying directly."
-        cp "${tmp_key}" "${keyring}" \
-            || { rm -f "${tmp_key}"; die "Failed to copy Okta PAM GPG key to ${keyring}."; }
-    fi
-    rm -f "${tmp_key}"
-    chmod 644 "${keyring}"
-
-    # Add repository – codename (e.g. focal, jammy, bullseye) is required by the Okta repo
     if [[ -z "${DISTRO_CODENAME}" ]]; then
         die "Unable to determine distribution codename. Cannot configure Okta PAM APT repository."
     fi
-    echo "deb [signed-by=${keyring}] ${OPA_REPO_DEB_URL} ${DISTRO_CODENAME} okta" \
-        > "${sources_file}"
 
+    # Step 1: Add repository key (exactly as per Okta docs)
+    curl -fsSL "${OPA_REPO_GPG_URL}" \
+        | gpg --dearmor \
+        | tee /usr/share/keyrings/oktapam-2023-archive-keyring.gpg > /dev/null \
+        || die "Failed to import Okta PAM GPG key."
+
+    # Step 2: Add repository (exactly as per Okta docs)
+    echo "deb [signed-by=/usr/share/keyrings/oktapam-2023-archive-keyring.gpg] ${OPA_REPO_DEB_URL} ${DISTRO_CODENAME} okta" \
+        | tee /etc/apt/sources.list.d/oktapam-stable.list > /dev/null \
+        || die "Failed to write Okta PAM APT sources list."
+
+    # Step 3: Update package lists
     DEBIAN_FRONTEND=noninteractive apt-get update -qq \
         || die "apt-get update failed after adding Okta PAM repo."
 
@@ -791,23 +765,9 @@ add_opa_repo_rpm() {
     local basearch
     basearch="$(uname -m)"
 
-    # Download and import GPG key. curl is used first so network errors are
-    # caught with a clear message before rpm --import is invoked.
-    local tmp_key
-    tmp_key="$(mktemp)"
-    log INFO "Downloading Okta PAM GPG key from ${OPA_REPO_GPG_URL}..."
-    curl -fsSL --connect-timeout 30 --retry 3 --retry-delay 5 \
-        -o "${tmp_key}" "${OPA_REPO_GPG_URL}" \
-        || { rm -f "${tmp_key}"; die "Failed to download Okta PAM GPG key (curl error). Check network connectivity and that ${OPA_REPO_GPG_URL} is reachable."; }
-
-    if [[ ! -s "${tmp_key}" ]]; then
-        rm -f "${tmp_key}"
-        die "Okta PAM GPG key file is empty. The URL may have changed – verify at https://help.okta.com/pam/en-us/"
-    fi
-
-    rpm --import "${tmp_key}" \
-        || { rm -f "${tmp_key}"; die "Failed to import Okta PAM GPG key (rpm --import failed)."; }
-    rm -f "${tmp_key}"
+    # Step 1: Import GPG key (exactly as per Okta docs)
+    rpm --import "${OPA_REPO_GPG_URL}" \
+        || die "Failed to import Okta PAM GPG key."
 
     # Map distro ID to the platform key used in the Okta RPM repo URL
     local platform_key
@@ -868,71 +828,42 @@ install_opa_agent() {
 }
 
 configure_opa_agent() {
-    log INFO "Configuring Okta Privilege Access Agent..."
+    log INFO "Configuring Okta Privilege Access Agent (sftd)..."
 
-    # Collect Okta team and enrollment token
-    if [[ -z "${OPA_TEAM}" ]]; then
-        OPA_TEAM="$(prompt_value "Enter your Okta PAM team name (visible in Okta Admin > Privileged Access)")"
-    fi
-
+    # Collect enrollment token
+    # Ref: https://help.okta.com/en-us/content/topics/privileged-access/server-agent/pam-create-server-enrollment-token.htm
     if [[ -z "${OPA_ENROLLMENT_TOKEN}" ]]; then
-        OPA_ENROLLMENT_TOKEN="$(prompt_secret "Enter the Agent Enrollment Token (from Okta Admin > Privileged Access > Gateway/Agent > Create Token)")"
+        [[ "${NON_INTERACTIVE}" == "1" ]] && die "OPA_ENROLLMENT_TOKEN is required in non-interactive mode (env var or --enrollment-token)."
+        OPA_ENROLLMENT_TOKEN="$(prompt_secret "Enter the Server Enrollment Token (from Okta Admin > Privileged Access > Projects > <project> > Enrollment > Create Token)")"
     fi
 
-    # The agent configuration directory (adjust path if Okta changes it)
-    local agent_config_dir="/etc/okta-pam-agent"
-    local agent_config_file="${agent_config_dir}/okta-pam-agent.yaml"
+    # Write the token to the path sftd reads on startup
+    local token_dir="/var/lib/sftd"
+    local token_file="${token_dir}/enrollment.token"
 
-    mkdir -p "${agent_config_dir}"
+    mkdir -p "${token_dir}"            || die "Failed to create ${token_dir}."
+    echo -n "${OPA_ENROLLMENT_TOKEN}" > "${token_file}" || die "Failed to write enrollment token to ${token_file}."
+    chmod 600 "${token_file}"          || die "Failed to set permissions on ${token_file}."
+    log SUCCESS "Enrollment token written to ${token_file}"
 
-    # Write the agent configuration
-    # NOTE: Exact keys may differ across Okta PAM Agent versions.
-    #       Cross-reference with: https://help.okta.com/pam/en-us/content/topics/pam/agent-config-reference.htm
-    cat > "${agent_config_file}" <<EOF
-# Okta Privilege Access Agent Configuration
-# Generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date)
-#
-# Full reference: https://help.okta.com/pam/en-us/
+    # sftd is enabled and started automatically by the package installer.
+    # Restart to pick up the token file if the service already started.
+    log INFO "Restarting ${OPA_AGENT_SERVICE} to apply enrollment token..."
+    systemctl restart "${OPA_AGENT_SERVICE}" || die "Failed to restart ${OPA_AGENT_SERVICE}."
 
-team: "${OPA_TEAM}"
-enrollmentToken: "${OPA_ENROLLMENT_TOKEN}"
-
-# Logging configuration
-log:
-  level: info
-  output: /var/log/okta-pam-agent/agent.log
-
-# TLS – always use system CA bundle; do not disable certificate verification
-tls:
-  insecureSkipVerify: false
-EOF
-
-    chmod 600 "${agent_config_file}"
-    log SUCCESS "Agent configuration written to ${agent_config_file}"
-
-    # Create log directory for the agent
-    mkdir -p /var/log/okta-pam-agent
-
-    # Enable and start the service
-    log INFO "Enabling and starting ${OPA_AGENT_SERVICE}..."
-    systemctl daemon-reload
-    systemctl enable "${OPA_AGENT_SERVICE}"  || die "Failed to enable ${OPA_AGENT_SERVICE}."
-    systemctl start  "${OPA_AGENT_SERVICE}"  || die "Failed to start ${OPA_AGENT_SERVICE}."
-
-    # Allow the service a moment to initialise before checking status
     sleep 3
 
     if systemctl is-active --quiet "${OPA_AGENT_SERVICE}"; then
-        log SUCCESS "Okta PAM Agent is running."
+        log SUCCESS "${OPA_AGENT_SERVICE} is running."
     else
-        log WARN "Okta PAM Agent did not start cleanly. Check: journalctl -u ${OPA_AGENT_SERVICE}"
+        log WARN "${OPA_AGENT_SERVICE} did not start cleanly. Check: journalctl -u ${OPA_AGENT_SERVICE}"
         log WARN "This may indicate an invalid enrollment token or network connectivity issue."
     fi
 
-    save_credential "OPA_AGENT_TEAM"             "${OPA_TEAM}"
+    log INFO "Verify enrollment: open Okta Admin > Privileged Access > Projects > <project> > Servers"
+
     save_credential "OPA_AGENT_ENROLLMENT_TOKEN" "${OPA_ENROLLMENT_TOKEN}"
-    save_credential "OPA_AGENT_CONFIG"           "${agent_config_file}"
-    save_credential "OPA_AGENT_LOG"              "/var/log/okta-pam-agent/agent.log"
+    save_credential "OPA_AGENT_TOKEN_FILE"       "${token_file}"
 }
 
 # ---------------------------------------------------------------------------
@@ -969,70 +900,57 @@ install_opa_gateway() {
 }
 
 configure_opa_gateway() {
-    log INFO "Configuring Okta Privilege Access Gateway..."
+    log INFO "Configuring Okta Privilege Access Gateway (sft-gatewayd)..."
 
-    if [[ -z "${OPA_TEAM}" ]]; then
-        OPA_TEAM="$(prompt_value "Enter your Okta PAM team name")"
-    fi
-
+    # Collect gateway setup token
+    # Ref: https://help.okta.com/en-us/content/topics/privileged-access/gateways/pam-gateway-configure.htm
     if [[ -z "${OPA_GATEWAY_TOKEN}" ]]; then
-        OPA_GATEWAY_TOKEN="$(prompt_secret "Enter the Gateway Enrollment Token (from Okta Admin > Privileged Access > Gateways > Add Gateway > Generate Token)")"
+        [[ "${NON_INTERACTIVE}" == "1" ]] && die "OPA_GATEWAY_TOKEN is required in non-interactive mode (env var or --gateway-token)."
+        OPA_GATEWAY_TOKEN="$(prompt_secret "Enter the Gateway Setup Token (from Okta Admin > Privileged Access > Gateways > Create Token)")"
     fi
 
-    local gw_config_dir="/etc/okta-pam-adserver-gateway"
-    local gw_config_file="${gw_config_dir}/gateway.yaml"
+    # Write the token to the path sft-gatewayd reads on startup.
+    # Using SetupTokenFile (recommended) — token is written to the default path.
+    # Ref: https://help.okta.com/en-us/content/topics/privileged-access/gateways/pam-gateway-configure.htm
+    local token_dir="/var/lib/sft-gatewayd"
+    local token_file="${token_dir}/setup.token"
 
-    mkdir -p "${gw_config_dir}"
+    mkdir -p "${token_dir}"            || die "Failed to create ${token_dir}."
+    echo -n "${OPA_GATEWAY_TOKEN}" > "${token_file}" || die "Failed to write gateway token to ${token_file}."
+    chmod 600 "${token_file}"          || die "Failed to set permissions on ${token_file}."
+    log SUCCESS "Gateway setup token written to ${token_file}"
 
-    # Write gateway configuration
-    # NOTE: Cross-reference with Okta PAM Gateway documentation:
-    #       https://help.okta.com/pam/en-us/content/topics/pam/gw-configure.htm
+    # Point the gateway config to the token file
+    local gw_config_file="/etc/sft/sft-gatewayd.yaml"
+    mkdir -p /etc/sft                  || die "Failed to create /etc/sft."
     cat > "${gw_config_file}" <<EOF
-# Okta Privilege Access Gateway Configuration
+# Okta PAM Gateway Configuration
 # Generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date)
-#
-# Full reference: https://help.okta.com/pam/en-us/
+# Ref: https://help.okta.com/en-us/content/topics/privileged-access/gateways/pam-gateway-configure.htm
 
-team: "${OPA_TEAM}"
-enrollmentToken: "${OPA_GATEWAY_TOKEN}"
-
-# Gateway listens on this port for PAM traffic; ensure it is firewalled
-# and only accessible by the Okta service planes.
-listenPort: 7234
-
-# Logging
-log:
-  level: info
-  output: /var/log/okta-pam-gateway/gateway.log
-
-# TLS – always verify; do not set insecureSkipVerify: true in production
-tls:
-  insecureSkipVerify: false
+SetupTokenFile: "${token_file}"
+LogLevel: info
 EOF
 
-    chmod 600 "${gw_config_file}"
+    chmod 600 "${gw_config_file}"      || die "Failed to set permissions on ${gw_config_file}."
     log SUCCESS "Gateway configuration written to ${gw_config_file}"
 
-    mkdir -p /var/log/okta-pam-gateway
-
-    log INFO "Enabling and starting ${OPA_GATEWAY_SERVICE}..."
-    systemctl daemon-reload
-    systemctl enable "${OPA_GATEWAY_SERVICE}"  || die "Failed to enable ${OPA_GATEWAY_SERVICE}."
-    systemctl start  "${OPA_GATEWAY_SERVICE}"  || die "Failed to start ${OPA_GATEWAY_SERVICE}."
+    log INFO "Restarting ${OPA_GATEWAY_SERVICE} to apply configuration..."
+    systemctl restart "${OPA_GATEWAY_SERVICE}" || die "Failed to restart ${OPA_GATEWAY_SERVICE}."
 
     sleep 3
 
     if systemctl is-active --quiet "${OPA_GATEWAY_SERVICE}"; then
-        log SUCCESS "Okta PAM Gateway is running."
+        log SUCCESS "${OPA_GATEWAY_SERVICE} is running."
     else
-        log WARN "Okta PAM Gateway did not start cleanly. Check: journalctl -u ${OPA_GATEWAY_SERVICE}"
+        log WARN "${OPA_GATEWAY_SERVICE} did not start cleanly. Check: journalctl -u ${OPA_GATEWAY_SERVICE}"
     fi
 
-    save_credential "OPA_GATEWAY_TEAM"         "${OPA_TEAM}"
-    save_credential "OPA_GATEWAY_TOKEN"        "${OPA_GATEWAY_TOKEN}"
-    save_credential "OPA_GATEWAY_CONFIG"       "${gw_config_file}"
-    save_credential "OPA_GATEWAY_LOG"          "/var/log/okta-pam-gateway/gateway.log"
-    save_credential "OPA_GATEWAY_LISTEN_PORT"  "7234"
+    log INFO "Verify gateway: open Okta Admin > Privileged Access > Gateways"
+
+    save_credential "OPA_GATEWAY_TOKEN"      "${OPA_GATEWAY_TOKEN}"
+    save_credential "OPA_GATEWAY_TOKEN_FILE" "${token_file}"
+    save_credential "OPA_GATEWAY_CONFIG"     "${gw_config_file}"
 }
 
 # ---------------------------------------------------------------------------
