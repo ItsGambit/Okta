@@ -1,6 +1,6 @@
 # Okta Privilege Access (OPA) Setup Script
 
-**Version:** 1.0.6
+**Version:** 1.0.8
 **Script:** `opa_setup.sh`
 
 ---
@@ -136,7 +136,7 @@ After downloading, confirm the script version before running:
 
 ```bash
 grep 'SCRIPT_VERSION=' opa_setup.sh
-# Expected: readonly SCRIPT_VERSION="1.0.6"
+# Expected: readonly SCRIPT_VERSION="1.0.8"
 ```
 
 ---
@@ -290,11 +290,11 @@ These variables are read before prompting, so pre-setting them reduces interacti
 
 | Item | Detail |
 |------|--------|
-| Package name | `okta-pam-agent` |
-| Repository | `https://packages.okta.com/okta-pam-agent/` |
-| Config file | `/etc/okta-pam-agent/okta-pam-agent.yaml` |
-| Log file | `/var/log/okta-pam-agent/agent.log` |
-| Systemd service | `okta-pam-agent` |
+| Package name | `scaleft-server-tools` |
+| Repository | `https://dist.scaleft.com/repos/` |
+| Config file | `/etc/sft/sftd.yaml` |
+| Log file | `journalctl -u sftd` or `/var/log/sftd.log` |
+| Systemd service | `sftd` |
 
 **What the script does:**
 1. Adds the official Okta PAM GPG key and package repository.
@@ -316,11 +316,11 @@ https://help.okta.com/pam/en-us/content/topics/pam/agent-install.htm
 
 | Item | Detail |
 |------|--------|
-| Package name | `okta-pam-adserver-gateway` |
-| Repository | `https://packages.okta.com/okta-pam-agent/` (shared with agent) |
-| Config file | `/etc/okta-pam-adserver-gateway/gateway.yaml` |
-| Log file | `/var/log/okta-pam-gateway/gateway.log` |
-| Systemd service | `okta-pam-adserver-gateway` |
+| Package name | `scaleft-gateway` |
+| Repository | `https://dist.scaleft.com/repos/` (shared with agent) |
+| Config file | `/etc/sft/sftd.yaml` |
+| Log file | `journalctl -u sftd` or `/var/log/sftd.log` |
+| Systemd service | `sftd` |
 | Listen port | `7234/TCP` (inbound — accepts connections from the OPA Client) |
 
 **What the script does:**
@@ -738,6 +738,27 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ## Changelog
 
+### v1.0.8 — 2026-04-21
+- **Fix (Critical):** `is_installed` was called with `OPA_AGENT_SERVICE`/`OPA_GATEWAY_SERVICE` (`sftd`) instead of the package names — it would never detect an existing agent or gateway installation. Now correctly uses `OPA_AGENT_PACKAGE` (`scaleft-server-tools`) and `OPA_GATEWAY_PACKAGE` (`scaleft-gateway`).
+- **Fix (Critical):** All calls to `uninstall_component` and `print_component_status` for Agent and Gateway — in `rollback_on_error`, `check_already_installed`, and `handle_already_installed_menu` — were passing the service name (`sftd`) as both the package and service argument. Now correctly pass the package constant for the `pkg` argument and service constant for `svc`.
+- **Fix (Critical):** `DISTRO_CODENAME` can be empty on systems where `/etc/os-release` omits `VERSION_CODENAME`. Added fallback to `lsb_release -cs` and a hard `die` guard in `add_opa_repo_deb` to prevent a malformed APT sources line from being written.
+- **Fix:** Removed no-op line `[[ "${DISTRO_ID}" == "amzn" ]] && DISTRO_ID="amzn"` in `detect_distro`.
+- **Fix:** MySQL service name detection rewritten as an `if/then/fi` block; the previous `&&` short-circuit form was ambiguous under `set -euo pipefail`.
+- **Fix:** All three `postgresql-setup initdb` / `postgresql-XX-setup initdb` calls now include `2>&1` before the pipe to `tee`, ensuring stderr is captured in the log and errors are properly detected under `pipefail`.
+- **Fix:** PostgreSQL service name detection now calls `systemctl list-unit-files` once and stores the result, eliminating the duplicate call and the fragile `&&` chain that could leave `pg_svc` empty.
+- **Fix:** `mysql_initial_args` array element `--password=...` is now quoted as a single element to prevent word splitting on passwords containing special characters.
+
+### v1.0.7 — 2026-04-21
+- **Fix:** Corrected all Okta PAM repository URLs, GPG key URL, and package names to match the official Okta documentation.
+  - GPG key URL updated from `https://packages.okta.com/okta-pam-agent/gpg` → `https://dist.scaleft.com/GPG-KEY-OktaPAM-2023`
+  - DEB repo URL updated from `https://packages.okta.com/okta-pam-agent/debian` → `https://dist.scaleft.com/repos/deb`
+  - DEB sources file renamed to `oktapam-stable.list`; keyring file renamed to `oktapam-2023-archive-keyring.gpg`
+  - DEB repo line now uses the distro codename (e.g. `focal`, `jammy`, `bullseye`) and channel `okta` as required by the Okta repo format
+  - RPM repo URL updated from `https://packages.okta.com/okta-pam-agent/rhel` → `https://dist.scaleft.com/repos/rpm/stable/<platform>/<version>/$basearch`; repo file renamed to `oktapam-stable.repo` with `repo_gpgcheck=1` added
+  - RPM platform key now mapped per distro: `rhel`/`centos`/`rocky`/`ol` → `rhel`, `almalinux` → `alma`, `amzn` → `amazonlinux`
+  - Agent package renamed from `okta-pam-agent` → `scaleft-server-tools`; service name updated to `sftd`
+  - Gateway package renamed from `okta-pam-adserver-gateway` → `scaleft-gateway`; service name updated to `sftd`
+
 ### v1.0.6 — 2026-04-21
 - **Fix:** GPG key import rewritten for all distributions to eliminate the silent-failure `curl | gpg --dearmor` pipe pattern.
   - **Debian/Ubuntu (`add_opa_repo_deb`):** Key is now downloaded to a temp file first so `curl` errors are caught independently. The key format is then detected — ASCII-armored keys (beginning with `-----BEGIN PGP`) are passed through `gpg --dearmor`; binary keys are copied directly to the keyring path. This resolves failures on clean installs where `packages.okta.com/okta-pam-agent/gpg` returns a binary `.gpg` file.
@@ -779,4 +800,4 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ---
 
-*Script: `opa_setup.sh` v1.0.6 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*
+*Script: `opa_setup.sh` v1.0.8 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*

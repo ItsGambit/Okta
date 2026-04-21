@@ -18,7 +18,7 @@
 # Usage       : sudo bash opa_setup.sh [OPTIONS]
 #               Run  sudo bash opa_setup.sh --help  for full option list.
 #
-# Version     : 1.0.6
+# Version     : 1.0.8
 # =============================================================================
 
 set -euo pipefail
@@ -28,14 +28,16 @@ IFS=$'\n\t'
 # SECTION 1 – Global variables, constants, and logging bootstrap
 # ---------------------------------------------------------------------------
 
-readonly SCRIPT_VERSION="1.0.6"
+readonly SCRIPT_VERSION="1.0.8"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 readonly LOG_DIR="/var/log/opa-setup"
 readonly LOG_FILE="${LOG_DIR}/opa_setup_${TIMESTAMP}.log"
 readonly CREDS_FILE="/root/.opa_credentials_${TIMESTAMP}.txt"
-readonly OPA_AGENT_SERVICE="okta-pam-agent"
-readonly OPA_GATEWAY_SERVICE="okta-pam-adserver-gateway"
+readonly OPA_AGENT_PACKAGE="scaleft-server-tools"
+readonly OPA_AGENT_SERVICE="sftd"
+readonly OPA_GATEWAY_PACKAGE="scaleft-gateway"
+readonly OPA_GATEWAY_SERVICE="sftd"
 
 # Minimum required versions (update if Okta releases new minimums)
 readonly MIN_UBUNTU_VERSION="20.04"
@@ -137,11 +139,11 @@ rollback_on_error() {
             uninstall_mysql 2>&1 | tee -a "${LOG_FILE}" || log WARN "MySQL rollback failed."
         fi
         if [[ "${ROLLBACK_AGENT}" == "1" ]]; then
-            uninstall_component "OPA Agent" "${OPA_AGENT_SERVICE}" "${OPA_AGENT_SERVICE}" \
+            uninstall_component "OPA Agent" "${OPA_AGENT_PACKAGE}" "${OPA_AGENT_SERVICE}" \
                 2>&1 | tee -a "${LOG_FILE}" || log WARN "OPA Agent rollback failed."
         fi
         if [[ "${ROLLBACK_GATEWAY}" == "1" ]]; then
-            uninstall_component "OPA Gateway" "${OPA_GATEWAY_SERVICE}" "${OPA_GATEWAY_SERVICE}" \
+            uninstall_component "OPA Gateway" "${OPA_GATEWAY_PACKAGE}" "${OPA_GATEWAY_SERVICE}" \
                 2>&1 | tee -a "${LOG_FILE}" || log WARN "OPA Gateway rollback failed."
         fi
         log INFO "Rollback complete. See ${LOG_FILE} for details."
@@ -345,11 +347,12 @@ detect_distro() {
     DISTRO_ID="${ID,,}"          # lowercase
     DISTRO_VERSION="${VERSION_ID:-unknown}"
     DISTRO_CODENAME="${VERSION_CODENAME:-}"
+    # Fallback: derive codename from lsb_release if os-release didn't provide it
+    if [[ -z "${DISTRO_CODENAME}" ]] && command -v lsb_release &>/dev/null; then
+        DISTRO_CODENAME="$(lsb_release -cs 2>/dev/null || true)"
+    fi
 
     log INFO "Detected: ID=${DISTRO_ID}  VERSION=${DISTRO_VERSION}  CODENAME=${DISTRO_CODENAME}"
-
-    # Normalise Amazon Linux ID
-    [[ "${DISTRO_ID}" == "amzn" ]] && DISTRO_ID="amzn"
 
     # Verify distro is in supported list
     local supported=0
@@ -577,8 +580,8 @@ check_already_installed() {
     local mysql_installed=0
     local pgsql_installed=0
 
-    is_installed "${OPA_AGENT_SERVICE}"        && agent_installed=1
-    is_installed "${OPA_GATEWAY_SERVICE}"      && gateway_installed=1
+    is_installed "${OPA_AGENT_PACKAGE}"        && agent_installed=1
+    is_installed "${OPA_GATEWAY_PACKAGE}"      && gateway_installed=1
     is_installed "mysql-server"                && mysql_installed=1
     is_installed "mysqld"                      && mysql_installed=1
     is_installed "postgresql"                  && pgsql_installed=1
@@ -593,13 +596,13 @@ check_already_installed() {
     if [[ "${agent_installed}" == "1" ]] && [[ "${INSTALL_AGENT}" == "1" || "${NON_INTERACTIVE}" == "0" ]]; then
         local rc=0
         handle_already_installed_menu "Okta Privilege Access Agent" \
-            "${OPA_AGENT_SERVICE}" "${OPA_AGENT_SERVICE}" || rc=$?
+            "${OPA_AGENT_PACKAGE}" "${OPA_AGENT_SERVICE}" || rc=$?
         case "${rc}" in
             0) log INFO "Exiting at user request."; exit 0 ;;
-            1) print_component_status "OPA Agent" "${OPA_AGENT_SERVICE}" "${OPA_AGENT_SERVICE}"
+            1) print_component_status "OPA Agent" "${OPA_AGENT_PACKAGE}" "${OPA_AGENT_SERVICE}"
                echo ""
                if ! prompt_yn "Continue with install options?"; then exit 0; fi ;;
-            2) uninstall_component "OPA Agent" "${OPA_AGENT_SERVICE}" "${OPA_AGENT_SERVICE}" ;;
+            2) uninstall_component "OPA Agent" "${OPA_AGENT_PACKAGE}" "${OPA_AGENT_SERVICE}" ;;
             3) INSTALL_AGENT=0 ;; # skip agent, continue to menu
         esac
     fi
@@ -608,13 +611,13 @@ check_already_installed() {
     if [[ "${gateway_installed}" == "1" ]] && [[ "${INSTALL_GATEWAY}" == "1" || "${NON_INTERACTIVE}" == "0" ]]; then
         local rc=0
         handle_already_installed_menu "Okta Privilege Access Gateway" \
-            "${OPA_GATEWAY_SERVICE}" "${OPA_GATEWAY_SERVICE}" || rc=$?
+            "${OPA_GATEWAY_PACKAGE}" "${OPA_GATEWAY_SERVICE}" || rc=$?
         case "${rc}" in
             0) log INFO "Exiting at user request."; exit 0 ;;
-            1) print_component_status "OPA Gateway" "${OPA_GATEWAY_SERVICE}" "${OPA_GATEWAY_SERVICE}"
+            1) print_component_status "OPA Gateway" "${OPA_GATEWAY_PACKAGE}" "${OPA_GATEWAY_SERVICE}"
                echo ""
                if ! prompt_yn "Continue with install options?"; then exit 0; fi ;;
-            2) uninstall_component "OPA Gateway" "${OPA_GATEWAY_SERVICE}" "${OPA_GATEWAY_SERVICE}" ;;
+            2) uninstall_component "OPA Gateway" "${OPA_GATEWAY_PACKAGE}" "${OPA_GATEWAY_SERVICE}" ;;
             3) INSTALL_GATEWAY=0 ;;
         esac
     fi
@@ -728,15 +731,15 @@ sql_server_submenu() {
 #       Always verify against:  https://help.okta.com/pam/en-us/
 # ---------------------------------------------------------------------------
 
-readonly OPA_REPO_GPG_URL="https://packages.okta.com/okta-pam-agent/gpg"
-readonly OPA_REPO_DEB_URL="https://packages.okta.com/okta-pam-agent/debian"
-readonly OPA_REPO_RPM_URL="https://packages.okta.com/okta-pam-agent/rhel"
+readonly OPA_REPO_GPG_URL="https://dist.scaleft.com/GPG-KEY-OktaPAM-2023"
+readonly OPA_REPO_DEB_URL="https://dist.scaleft.com/repos/deb"
+readonly OPA_REPO_RPM_BASE_URL="https://dist.scaleft.com/repos/rpm/stable"
 
 add_opa_repo_deb() {
     log INFO "Adding Okta PAM APT repository..."
 
-    local keyring="/usr/share/keyrings/okta-pam-agent.gpg"
-    local sources_file="/etc/apt/sources.list.d/okta-pam-agent.list"
+    local keyring="/usr/share/keyrings/oktapam-2023-archive-keyring.gpg"
+    local sources_file="/etc/apt/sources.list.d/oktapam-stable.list"
     local tmp_key
     tmp_key="$(mktemp)"
 
@@ -767,8 +770,11 @@ add_opa_repo_deb() {
     rm -f "${tmp_key}"
     chmod 644 "${keyring}"
 
-    # Add repository
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=${keyring}] ${OPA_REPO_DEB_URL} stable main" \
+    # Add repository – codename (e.g. focal, jammy, bullseye) is required by the Okta repo
+    if [[ -z "${DISTRO_CODENAME}" ]]; then
+        die "Unable to determine distribution codename. Cannot configure Okta PAM APT repository."
+    fi
+    echo "deb [signed-by=${keyring}] ${OPA_REPO_DEB_URL} ${DISTRO_CODENAME} okta" \
         > "${sources_file}"
 
     DEBIAN_FRONTEND=noninteractive apt-get update -qq \
@@ -803,13 +809,23 @@ add_opa_repo_rpm() {
         || { rm -f "${tmp_key}"; die "Failed to import Okta PAM GPG key (rpm --import failed)."; }
     rm -f "${tmp_key}"
 
+    # Map distro ID to the platform key used in the Okta RPM repo URL
+    local platform_key
+    case "${DISTRO_ID}" in
+        rhel|centos|rocky|ol) platform_key="rhel" ;;
+        almalinux)            platform_key="alma" ;;
+        amzn)                 platform_key="amazonlinux" ;;
+        *)                    platform_key="rhel" ;;  # sensible fallback
+    esac
+
     # Write repo file
-    cat > /etc/yum.repos.d/okta-pam-agent.repo <<EOF
-[okta-pam-agent]
-name=Okta PAM Agent - \$basearch
-baseurl=${OPA_REPO_RPM_URL}/${releasever}/\$basearch
-enabled=1
+    cat > /etc/yum.repos.d/oktapam-stable.repo <<EOF
+[oktapam-stable]
+name=Okta PAM Stable - ${platform_key} ${releasever}
+baseurl=${OPA_REPO_RPM_BASE_URL}/${platform_key}/${releasever}/\$basearch
 gpgcheck=1
+repo_gpgcheck=1
+enabled=1
 gpgkey=${OPA_REPO_GPG_URL}
 EOF
 
@@ -836,18 +852,18 @@ install_opa_agent() {
 
     case "${PKG_MGR}" in
         apt)
-            DEBIAN_FRONTEND=noninteractive apt-get install -y okta-pam-agent \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${OPA_AGENT_PACKAGE}" \
                 | tee -a "${LOG_FILE}" \
-                || die "Failed to install okta-pam-agent."
+                || die "Failed to install ${OPA_AGENT_PACKAGE}."
             ;;
         dnf|yum)
-            ${PKG_MGR} install -y okta-pam-agent \
+            ${PKG_MGR} install -y "${OPA_AGENT_PACKAGE}" \
                 | tee -a "${LOG_FILE}" \
-                || die "Failed to install okta-pam-agent."
+                || die "Failed to install ${OPA_AGENT_PACKAGE}."
             ;;
     esac
 
-    log SUCCESS "okta-pam-agent package installed."
+    log SUCCESS "${OPA_AGENT_PACKAGE} package installed."
     configure_opa_agent
 }
 
@@ -930,25 +946,25 @@ install_opa_gateway() {
 
     # The gateway uses the same Okta PAM repository as the agent
     # (repo may already have been added if the agent was installed first)
-    if [[ ! -f /etc/apt/sources.list.d/okta-pam-agent.list ]] && \
-       [[ ! -f /etc/yum.repos.d/okta-pam-agent.repo ]]; then
+    if [[ ! -f /etc/apt/sources.list.d/oktapam-stable.list ]] && \
+       [[ ! -f /etc/yum.repos.d/oktapam-stable.repo ]]; then
         add_opa_repo
     fi
 
     case "${PKG_MGR}" in
         apt)
-            DEBIAN_FRONTEND=noninteractive apt-get install -y okta-pam-adserver-gateway \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${OPA_GATEWAY_PACKAGE}" \
                 | tee -a "${LOG_FILE}" \
-                || die "Failed to install okta-pam-adserver-gateway."
+                || die "Failed to install ${OPA_GATEWAY_PACKAGE}."
             ;;
         dnf|yum)
-            ${PKG_MGR} install -y okta-pam-adserver-gateway \
+            ${PKG_MGR} install -y "${OPA_GATEWAY_PACKAGE}" \
                 | tee -a "${LOG_FILE}" \
-                || die "Failed to install okta-pam-adserver-gateway."
+                || die "Failed to install ${OPA_GATEWAY_PACKAGE}."
             ;;
     esac
 
-    log SUCCESS "okta-pam-adserver-gateway package installed."
+    log SUCCESS "${OPA_GATEWAY_PACKAGE} package installed."
     configure_opa_gateway
 }
 
@@ -1071,8 +1087,9 @@ install_mysql() {
 
     # Determine correct service name (varies by distro)
     local mysql_svc="mysql"
-    systemctl list-unit-files --type=service 2>/dev/null | grep -q "^mysqld.service" \
-        && mysql_svc="mysqld"
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^mysqld.service"; then
+        mysql_svc="mysqld"
+    fi
 
     log INFO "Enabling and starting MySQL..."
     systemctl enable "${mysql_svc}"
@@ -1113,7 +1130,7 @@ setup_mysql() {
         fi
         if [[ -n "${mysql_tmp_pass}" ]]; then
             log INFO "Using temporary MySQL root password from ${mysql_log}."
-            mysql_initial_args=(--connect-expired-password --password="${mysql_tmp_pass}")
+            mysql_initial_args=(--connect-expired-password "--password=${mysql_tmp_pass}")
         else
             log INFO "No temporary MySQL root password found; attempting passwordless initial connection."
         fi
@@ -1369,7 +1386,7 @@ https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
                     ${PKG_MGR} install -y postgresql15-server postgresql15 \
                         | tee -a "${LOG_FILE}" \
                         || die "Failed to install PostgreSQL on Amazon Linux 2023."
-                    postgresql-setup --initdb \
+                    postgresql-setup --initdb 2>&1 \
                         | tee -a "${LOG_FILE}" \
                         || die "PostgreSQL initdb failed on Amazon Linux 2023."
                 else
@@ -1381,7 +1398,7 @@ https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
                     ${PKG_MGR} install -y postgresql-server \
                         | tee -a "${LOG_FILE}" \
                         || die "Failed to install PostgreSQL on Amazon Linux 2."
-                    postgresql-setup initdb \
+                    postgresql-setup initdb 2>&1 \
                         | tee -a "${LOG_FILE}" \
                         || die "PostgreSQL initdb failed on Amazon Linux 2."
                 fi
@@ -1404,7 +1421,7 @@ https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
                     || die "Failed to install PostgreSQL ${pg_ver}."
 
                 # Initialise the database cluster
-                "/usr/pgsql-${pg_ver}/bin/postgresql-${pg_ver}-setup" initdb \
+                "/usr/pgsql-${pg_ver}/bin/postgresql-${pg_ver}-setup" initdb 2>&1 \
                     | tee -a "${LOG_FILE}" \
                     || die "PostgreSQL initdb failed."
             fi
@@ -1415,11 +1432,11 @@ https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
 
     # Determine service name
     local pg_svc="postgresql"
-    systemctl list-unit-files --type=service 2>/dev/null | grep -q "^postgresql-[0-9]" \
-        && pg_svc="$(systemctl list-unit-files --type=service 2>/dev/null \
-                     | grep "^postgresql-[0-9]" | awk '{print $1}' | head -1)"
-    # Strip .service suffix if present
-    pg_svc="${pg_svc%.service}"
+    local found_svc
+    found_svc="$(systemctl list-unit-files --type=service 2>/dev/null \
+        | grep "^postgresql-[0-9]" | awk '{print $1}' | head -1)"
+    found_svc="${found_svc%.service}"
+    [[ -n "${found_svc}" ]] && pg_svc="${found_svc}"
 
     log INFO "Enabling and starting ${pg_svc}..."
     systemctl enable "${pg_svc}"
