@@ -188,7 +188,7 @@ prompt_secret() {
     local secret=""
     while [[ -z "${secret}" ]]; do
         read -r -s -p "${question}: " secret
-        echo ""
+        echo "" >&2
     done
     echo "${secret}"
 }
@@ -1511,17 +1511,17 @@ get_sample_data_rows() {
         return
     fi
 
-    echo ""
-    echo "  How many sample rows would you like to seed into the database?"
-    echo "  Options: 10 | 100 | 500 | 1000 | 5000 | 10000  (or enter a custom number)"
-    echo ""
+    echo "" >&2
+    echo "  How many sample rows would you like to seed into the database?" >&2
+    echo "  Options: 10 | 100 | 500 | 1000 | 5000 | 10000  (or enter a custom number)" >&2
+    echo "" >&2
 
     local rows=""
     while ! [[ "${rows}" =~ ^[0-9]+$ && "${rows}" -gt 0 ]]; do
         read -r -p "  Row count [default: 100]: " rows
         rows="${rows:-100}"
         if ! [[ "${rows}" =~ ^[0-9]+$ ]] || [[ "${rows}" -lt 1 ]]; then
-            echo "  Please enter a positive integer."
+            echo "  Please enter a positive integer." >&2
             rows=""
         fi
     done
