@@ -18,7 +18,7 @@
 # Usage       : sudo bash opa_setup.sh [OPTIONS]
 #               Run  sudo bash opa_setup.sh --help  for full option list.
 #
-# Version     : 1.1.7
+# Version     : 1.1.8
 # =============================================================================
 
 set -euo pipefail
@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # SECTION 1 – Global variables, constants, and logging bootstrap
 # ---------------------------------------------------------------------------
 
-readonly SCRIPT_VERSION="1.1.7"
+readonly SCRIPT_VERSION="1.1.8"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 readonly LOG_DIR="/var/log/opa-setup"
@@ -232,17 +232,22 @@ prompt_value() {
         return
     fi
     if [[ -n "${default}" ]]; then
-        read -r -p "${question} [${default}]: " result
+        echo -e "\033[0;36m${question} [${default}]:\033[0m" >/dev/tty
+        read -r -p $'\033[0;36m> \033[0m' result </dev/tty
         result="${result:-${default}}"
     else
         while [[ -z "${result}" ]]; do
-            read -r -p "${question}: " result
+            echo -e "\033[0;36m${question}:\033[0m" >/dev/tty
+            read -r -p $'\033[0;36m> \033[0m' result </dev/tty
         done
     fi
     echo "${result}"
 }
 
-# Prompt for a secret (no echo).
+# Prompt for a secret (no echo).  The question label is printed in cyan to
+# /dev/tty so it is visible in all SSH clients (PuTTY, MobaXterm, etc.) even
+# when the function is invoked inside a $() command substitution where stdout
+# is captured.  The -s flag suppresses the typed characters.
 prompt_secret() {
     local question="${1}"
     local default="${2:-}"
@@ -252,8 +257,8 @@ prompt_secret() {
     fi
     local secret=""
     while [[ -z "${secret}" ]]; do
-        read -r -s -p "${question}: " secret
-        echo "" >&2
+        echo -e "\033[0;36m${question}:\033[0m" >/dev/tty
+        read -r -p $'\033[0;36m> \033[0m' secret </dev/tty
     done
     echo "${secret}"
 }

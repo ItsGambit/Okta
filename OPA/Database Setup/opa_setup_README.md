@@ -1,6 +1,6 @@
 # Okta Privilege Access (OPA) Setup Script
 
-**Version:** 1.1.7
+**Version:** 1.1.8
 **Script:** `opa_setup.sh`
 
 ---
@@ -101,9 +101,6 @@ Before running the script you need:
 
 ## Downloading the Script
 
-The script is hosted on GitHub at:
-**https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh**
-
 ### Download with curl
 
 ```bash
@@ -136,7 +133,7 @@ After downloading, confirm the script version before running:
 
 ```bash
 grep 'SCRIPT_VERSION=' opa_setup.sh
-# Expected: readonly SCRIPT_VERSION="1.1.7"
+# Expected: readonly SCRIPT_VERSION="1.1.8"
 ```
 
 ---
@@ -741,6 +738,9 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ## Changelog
 
+### v1.1.8 — 2026-04-21
+- **Fix (UX):** Enrollment token and gateway token prompts were invisible in PuTTY and other SSH clients with dark backgrounds. `prompt_secret` and `prompt_value` now print the question label in cyan via `echo -e` directly to `/dev/tty`, bypassing stdout capture from `$()` command substitution. The input caret (`> `) is also coloured cyan. This fix applies to all interactive prompts in the script and works correctly in PuTTY, MobaXterm, OpenSSH, and Windows Terminal.
+
 ### v1.1.7 — 2026-04-21
 - **Fix (Critical):** `systemctl_manage` previously returned `0` for `start`/`stop`/`restart` when `systemctl` was absent, leaving the database daemon unstarted while the script continued into `setup_mysql`/`setup_postgresql` — causing a guaranteed crash. Now falls back to the `service` SysV command for start/stop/restart; dies with a clear message if neither `systemctl` nor `service` is available. Non-critical operations (enable, disable, reload, daemon-reload) still skip gracefully.
 - **Fix (Critical):** `get_sample_data_rows` assigned `SAMPLE_DATA_ROWS="${rows}"` inside the function body, which was always called via `$()` command substitution (a subshell). The assignment was silently discarded when the subshell exited, leaving the global variable unchanged. Removed the dead global assignment — the value is correctly returned via `echo` and captured by the callers.
@@ -856,5 +856,3 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 - Initial release: OPA Agent, OPA Gateway, MySQL, PostgreSQL installation and configuration.
 
 ---
-
-*Script: `opa_setup.sh` v1.1.7 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*
