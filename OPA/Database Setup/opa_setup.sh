@@ -18,17 +18,18 @@
 # Usage       : sudo bash opa_setup.sh [OPTIONS]
 #               Run  sudo bash opa_setup.sh --help  for full option list.
 #
-# Version     : 1.1.4
+# Version     : 1.1.7
 # =============================================================================
 
 set -euo pipefail
+set -E            # propagate ERR trap into functions and subshells
 IFS=$'\n\t'
 
 # ---------------------------------------------------------------------------
 # SECTION 1 – Global variables, constants, and logging bootstrap
 # ---------------------------------------------------------------------------
 
-readonly SCRIPT_VERSION="1.1.4"
+readonly SCRIPT_VERSION="1.1.7"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 readonly LOG_DIR="/var/log/opa-setup"
@@ -108,7 +109,7 @@ log() {
     # Write to stderr for ERROR / WARN; stdout for everything else
     case "${level}" in
         ERROR)   echo -e "\033[0;31m${formatted}\033[0m" >&2 ;;
-        WARN)    echo -e "\033[0;33m${formatted}\033[0m" ;;
+        WARN)    echo -e "\033[0;33m${formatted}\033[0m" >&2 ;;
         SUCCESS) echo -e "\033[0;32m${formatted}\033[0m" ;;
         DEBUG)   [[ "${VERBOSE:-0}" == "1" ]] && echo "${formatted}" ;;
         *)       echo "${formatted}" ;;
@@ -128,10 +129,43 @@ separator() { log INFO "--------------------------------------------------------
 # Usage: systemctl_cmd <subcommand> [args...]
 systemctl_cmd() {
     if ! command -v systemctl &>/dev/null; then
-        log WARN "systemctl not available; skipping: systemctl $*"
-        return 0
+        log WARN "systemctl not available; cannot run: systemctl $*"
+        return 127
     fi
     systemctl "$@"
+}
+
+# Service management wrapper: runs systemctl_cmd and gracefully handles environments
+# where systemctl is absent (exit 127).
+# - For start/stop/restart: falls back to the `service` SysV command if available,
+#   otherwise dies — silently succeeding would leave the daemon unstarted.
+# - For enable/disable/reload/daemon-reload and other operations: skips gracefully
+#   (returns 0) since these are no-ops in non-systemd environments.
+# Use this wrapper for all service management so || die only fires on real failures.
+systemctl_manage() {
+    local rc=0
+    systemctl_cmd "$@" || rc=$?
+    if [[ "${rc}" -ne 127 ]]; then
+        return "${rc}"
+    fi
+    # systemctl unavailable — decide based on the subcommand
+    local subcmd="${1:-}"
+    case "${subcmd}" in
+        start|stop|restart)
+            local svc="${2:-}"
+            if command -v service &>/dev/null && [[ -n "${svc}" ]]; then
+                log WARN "systemctl unavailable; falling back to: service ${svc} ${subcmd}"
+                service "${svc}" "${subcmd}"
+            else
+                die "Cannot ${subcmd} ${svc}: systemctl is unavailable and no 'service' fallback found."
+            fi
+            ;;
+        *)
+            # enable, disable, reload, daemon-reload, etc. — skip gracefully
+            log WARN "systemctl unavailable; skipping: systemctl $*"
+            return 0
+            ;;
+    esac
 }
 
 # Called automatically on exit via trap.  Only performs rollback when the
@@ -159,20 +193,6 @@ rollback_on_error() {
         log INFO "Rollback complete. See ${LOG_FILE} for details."
     fi
     exit "${exit_code}"
-}
-
-# Run a command, logging it and its output.  Exits on failure unless the
-# caller passes  || true  to suppress.
-run_cmd() {
-    log DEBUG "Running: $*"
-    if output=$("$@" 2>&1); then
-        log DEBUG "Output: ${output}"
-    else
-        local exit_code=$?
-        log ERROR "Command failed (exit ${exit_code}): $*"
-        log ERROR "Output: ${output}"
-        return ${exit_code}
-    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -249,6 +269,9 @@ generate_password() {
     pass="$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()-_=+' < /dev/urandom 2>/dev/null \
             | head -c "${length}")"
     set -o pipefail
+    if [[ -z "${pass}" ]]; then
+        die "Failed to generate password: /dev/urandom unavailable or tr produced no output."
+    fi
     echo "${pass}"
 }
 
@@ -259,6 +282,9 @@ generate_username() {
     set +o pipefail
     suffix="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 6)"
     set -o pipefail
+    if [[ -z "${suffix}" ]]; then
+        die "Failed to generate username suffix: /dev/urandom unavailable or tr produced no output."
+    fi
     echo "${prefix}_${suffix}"
 }
 
@@ -266,7 +292,9 @@ generate_username() {
 save_credential() {
     local key="${1}"
     local value="${2}"
-    echo "${key}=${value}" >> "${CREDS_FILE}"
+    # Use printf %q to shell-escape the value so special characters (spaces, quotes,
+    # backslashes) don't corrupt the KEY=value format or break tooling that reads the file.
+    printf '%s=%q\n' "${key}" "${value}" >> "${CREDS_FILE}"
 }
 
 # ---------------------------------------------------------------------------
@@ -331,7 +359,14 @@ parse_args() {
             --install-postgresql)   INSTALL_POSTGRESQL=1 ;;
             --enrollment-token=*)   OPA_ENROLLMENT_TOKEN="${arg#*=}" ;;
             --gateway-token=*)      OPA_GATEWAY_TOKEN="${arg#*=}" ;;
-            --sample-data-rows=*)   SAMPLE_DATA_ROWS="${arg#*=}" ;;
+            --sample-data-rows=*)
+                local _rows="${arg#*=}"
+                if [[ "${_rows}" =~ ^[0-9]+$ && "${_rows}" -gt 0 ]]; then
+                    SAMPLE_DATA_ROWS="${_rows}"
+                else
+                    die "Invalid value for --sample-data-rows: '${_rows}'. Must be a positive integer."
+                fi
+                ;;
             *)
                 if [[ "${NON_INTERACTIVE}" == "1" ]]; then
                     die "Unknown argument: ${arg}. Use --help for usage."
@@ -532,8 +567,8 @@ uninstall_component() {
 
     log INFO "Uninstalling ${label}..."
     if systemctl_cmd is-active --quiet "${svc}" 2>/dev/null; then
-        systemctl_cmd stop "${svc}"  || log WARN "Could not stop ${svc}."
-        systemctl_cmd disable "${svc}" || log WARN "Could not disable ${svc}."
+        systemctl_manage stop "${svc}"    || log WARN "Could not stop ${svc}."
+        systemctl_manage disable "${svc}" || log WARN "Could not disable ${svc}."
     fi
 
     case "${PKG_MGR}" in
@@ -700,7 +735,7 @@ interactive_install_menu() {
         IFS=' ' read -ra tokens <<< "${choices}"
         # Validate each token is 1, 2, or 3
         local valid=1
-        for tok in "${tokens[@]+"${tokens[@]}"}"; do
+        for tok in "${tokens[@]}"; do
             [[ "${tok}" =~ ^[123]$ ]] || { valid=0; break; }
         done
         if [[ "${valid}" == "0" || "${#tokens[@]}" -eq 0 ]]; then
@@ -866,12 +901,16 @@ configure_opa_agent() {
     # sftd is enabled and started automatically by the package installer.
     # Restart to pick up the token file if the service already started.
     log INFO "Restarting ${OPA_AGENT_SERVICE} to apply enrollment token..."
-    systemctl_cmd restart "${OPA_AGENT_SERVICE}" || die "Failed to restart ${OPA_AGENT_SERVICE}."
+    systemctl_manage restart "${OPA_AGENT_SERVICE}" || die "Failed to restart ${OPA_AGENT_SERVICE}."
 
     sleep 3
 
-    if systemctl_cmd is-active --quiet "${OPA_AGENT_SERVICE}"; then
+    local agent_rc=0
+    systemctl_cmd is-active --quiet "${OPA_AGENT_SERVICE}" 2>/dev/null || agent_rc=$?
+    if [[ "${agent_rc}" -eq 0 ]]; then
         log SUCCESS "${OPA_AGENT_SERVICE} is running."
+    elif [[ "${agent_rc}" -eq 127 ]]; then
+        log WARN "Cannot verify ${OPA_AGENT_SERVICE} status (systemctl unavailable)."
     else
         log WARN "${OPA_AGENT_SERVICE} did not start cleanly. Check: journalctl -u ${OPA_AGENT_SERVICE}"
         log WARN "This may indicate an invalid enrollment token or network connectivity issue."
@@ -962,12 +1001,16 @@ EOF
     log SUCCESS "Gateway configuration written to ${gw_config_file}"
 
     log INFO "Restarting ${OPA_GATEWAY_SERVICE} to apply configuration..."
-    systemctl_cmd restart "${OPA_GATEWAY_SERVICE}" || die "Failed to restart ${OPA_GATEWAY_SERVICE}."
+    systemctl_manage restart "${OPA_GATEWAY_SERVICE}" || die "Failed to restart ${OPA_GATEWAY_SERVICE}."
 
     sleep 3
 
-    if systemctl_cmd is-active --quiet "${OPA_GATEWAY_SERVICE}"; then
+    local gw_rc=0
+    systemctl_cmd is-active --quiet "${OPA_GATEWAY_SERVICE}" 2>/dev/null || gw_rc=$?
+    if [[ "${gw_rc}" -eq 0 ]]; then
         log SUCCESS "${OPA_GATEWAY_SERVICE} is running."
+    elif [[ "${gw_rc}" -eq 127 ]]; then
+        log WARN "Cannot verify ${OPA_GATEWAY_SERVICE} status (systemctl unavailable)."
     else
         log WARN "${OPA_GATEWAY_SERVICE} did not start cleanly. Check: journalctl -u ${OPA_GATEWAY_SERVICE}"
     fi
@@ -1036,14 +1079,19 @@ install_mysql() {
     fi
 
     log INFO "Enabling and starting MySQL..."
-    systemctl_cmd enable "${mysql_svc}"
-    systemctl_cmd start  "${mysql_svc}" || die "Failed to start MySQL."
+    systemctl_manage enable "${mysql_svc}"
+    systemctl_manage start  "${mysql_svc}" || die "Failed to start MySQL."
     sleep 2
 
-    if ! systemctl_cmd is-active --quiet "${mysql_svc}"; then
+    local mysql_start_rc=0
+    systemctl_cmd is-active --quiet "${mysql_svc}" 2>/dev/null || mysql_start_rc=$?
+    if [[ "${mysql_start_rc}" -eq 1 ]]; then
         die "MySQL failed to start. Check: journalctl -u ${mysql_svc}"
+    elif [[ "${mysql_start_rc}" -eq 127 ]]; then
+        log WARN "Cannot verify MySQL status (systemctl unavailable); continuing..."
+    else
+        log SUCCESS "MySQL is running."
     fi
-    log SUCCESS "MySQL is running."
 
     setup_mysql "${mysql_svc}"
 }
@@ -1069,8 +1117,8 @@ setup_mysql() {
         local mysql_tmp_pass=""
         local mysql_log="/var/log/mysqld.log"
         if [[ -f "${mysql_log}" ]]; then
-            mysql_tmp_pass="$(grep -oP '(?<=temporary password is generated for root@localhost: )\S+' \
-                              "${mysql_log}" 2>/dev/null | tail -1 || true)"
+            mysql_tmp_pass="$(awk '/temporary password is generated for root@localhost:/ {print $NF}' \
+                              "${mysql_log}" | tail -1 || true)"
         fi
         if [[ -n "${mysql_tmp_pass}" ]]; then
             log INFO "Using temporary MySQL root password from ${mysql_log}."
@@ -1152,7 +1200,7 @@ slow_query_log_file=/var/log/mysql/slow.log
 long_query_time=2
 EOF
 
-    systemctl_cmd restart "${mysql_svc}" || log WARN "MySQL restart failed after applying hardening config."
+    systemctl_manage restart "${mysql_svc}" || log WARN "MySQL restart failed after applying hardening config."
     log SUCCESS "MySQL hardening configuration applied."
 
     save_credential "MYSQL_ROOT_PASSWORD"   "${MYSQL_ROOT_PASSWORD}"
@@ -1292,7 +1340,7 @@ install_postgresql() {
                 die "PostgreSQL GPG key file is empty."
             fi
 
-            if head -c 27 "${tmp_pg_key}" | grep -q "BEGIN PGP"; then
+            if grep -q "^-----BEGIN PGP" "${tmp_pg_key}"; then
                 gpg --batch --yes --dearmor -o "${pg_keyring}" "${tmp_pg_key}" \
                     || { rm -f "${tmp_pg_key}"; die "Failed to import PostgreSQL GPG key (gpg --dearmor failed)."; }
             else
@@ -1383,14 +1431,19 @@ https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
     [[ -n "${found_svc}" ]] && pg_svc="${found_svc}"
 
     log INFO "Enabling and starting ${pg_svc}..."
-    systemctl_cmd enable "${pg_svc}"
-    systemctl_cmd start  "${pg_svc}" || die "Failed to start PostgreSQL."
+    systemctl_manage enable "${pg_svc}"
+    systemctl_manage start  "${pg_svc}" || die "Failed to start PostgreSQL."
     sleep 2
 
-    if ! systemctl_cmd is-active --quiet "${pg_svc}"; then
+    local pg_start_rc=0
+    systemctl_cmd is-active --quiet "${pg_svc}" 2>/dev/null || pg_start_rc=$?
+    if [[ "${pg_start_rc}" -eq 1 ]]; then
         die "PostgreSQL failed to start. Check: journalctl -u ${pg_svc}"
+    elif [[ "${pg_start_rc}" -eq 127 ]]; then
+        log WARN "Cannot verify PostgreSQL status (systemctl unavailable); continuing..."
+    else
+        log SUCCESS "PostgreSQL is running (service: ${pg_svc})."
     fi
-    log SUCCESS "PostgreSQL is running (service: ${pg_svc})."
 
     setup_postgresql "${pg_svc}"
 }
@@ -1491,7 +1544,7 @@ EOF
         chown postgres:postgres "${hba_conf}"
         chmod 600 "${hba_conf}"
 
-        systemctl_cmd reload "${pg_svc}" || log WARN "PostgreSQL reload failed."
+        systemctl_manage reload "${pg_svc}" || log WARN "PostgreSQL reload failed."
         log SUCCESS "PostgreSQL hardening configuration applied."
     else
         log WARN "Could not locate PostgreSQL data directory; skipping hardening config."
@@ -1682,7 +1735,6 @@ get_sample_data_rows() {
         fi
     done
 
-    SAMPLE_DATA_ROWS="${rows}"
     echo "${rows}"
 }
 
@@ -1759,7 +1811,7 @@ main() {
 
     # ERR trap – logs the failing command and line number before the EXIT trap fires.
     # shellcheck disable=SC2154
-    trap 'log ERROR "Command failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
+    trap 'log ERROR "Command failed at line ${LINENO:-?}: ${BASH_COMMAND:-unknown}"' ERR
 
     # Register rollback trap – fires on any non-zero exit
     trap 'rollback_on_error $?' EXIT
@@ -1791,8 +1843,12 @@ main() {
     # Validate that at least one install target is selected
     if [[ "${INSTALL_AGENT}" == "0" && "${INSTALL_GATEWAY}" == "0" && \
           "${INSTALL_MYSQL}" == "0" && "${INSTALL_POSTGRESQL}" == "0" ]]; then
-        log WARN "No install targets selected. Nothing to do."
-        exit 0
+        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+            die "No install targets specified in non-interactive mode. Use at least one --install-* flag."
+        else
+            log WARN "No install targets selected. Nothing to do."
+            exit 0
+        fi
     fi
 
     # Step 5: Install and configure selected components

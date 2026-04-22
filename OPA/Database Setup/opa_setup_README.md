@@ -1,6 +1,6 @@
 # Okta Privilege Access (OPA) Setup Script
 
-**Version:** 1.1.4
+**Version:** 1.1.7
 **Script:** `opa_setup.sh`
 
 ---
@@ -136,7 +136,7 @@ After downloading, confirm the script version before running:
 
 ```bash
 grep 'SCRIPT_VERSION=' opa_setup.sh
-# Expected: readonly SCRIPT_VERSION="1.1.4"
+# Expected: readonly SCRIPT_VERSION="1.1.7"
 ```
 
 ---
@@ -741,6 +741,30 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ## Changelog
 
+### v1.1.7 — 2026-04-21
+- **Fix (Critical):** `systemctl_manage` previously returned `0` for `start`/`stop`/`restart` when `systemctl` was absent, leaving the database daemon unstarted while the script continued into `setup_mysql`/`setup_postgresql` — causing a guaranteed crash. Now falls back to the `service` SysV command for start/stop/restart; dies with a clear message if neither `systemctl` nor `service` is available. Non-critical operations (enable, disable, reload, daemon-reload) still skip gracefully.
+- **Fix (Critical):** `get_sample_data_rows` assigned `SAMPLE_DATA_ROWS="${rows}"` inside the function body, which was always called via `$()` command substitution (a subshell). The assignment was silently discarded when the subshell exited, leaving the global variable unchanged. Removed the dead global assignment — the value is correctly returned via `echo` and captured by the callers.
+- **Fix (Medium):** MySQL temporary root password extraction used `grep -oP` (Perl-Compatible Regex), which is not available on all minimal Linux distributions (Alpine, minimal RHEL/Rocky/AlmaLinux). Replaced with a portable `awk '/temporary password/ {print $NF}'` equivalent.
+- **Fix (Medium):** Removed the dead `run_cmd` helper function — it was never called anywhere in the script, and its `output` variable was declared without `local`, polluting the global namespace.
+- **Fix (Minor):** PostgreSQL GPG key ASCII-armor check used `head -c 27` byte count to detect `BEGIN PGP`, which is brittle to encoding differences and leading whitespace. Replaced with `grep -q "^-----BEGIN PGP"` for robust detection.
+- **Fix (Minor):** Simplified `"${tokens[@]+"${tokens[@]}"}"` to `"${tokens[@]}"` in the interactive install menu loop. The defensive expansion was unnecessary — a prior `${#tokens[@]} -eq 0` guard guarantees the array is non-empty before reaching the loop.
+
+### v1.1.6 — 2026-04-21
+- **Fix (Critical):** `log SUCCESS "MySQL is running."` was outside the `if/elif/fi` block in `install_mysql`, firing unconditionally — including when systemctl was unavailable and MySQL status was unknown. Moved inside an `else` clause so it only logs on confirmed rc=0.
+- **Fix (Critical):** Same false-success issue in `install_postgresql`: `log SUCCESS "PostgreSQL is running..."` moved inside `else` clause of its `if/elif/fi` block.
+- **Fix (Medium):** `generate_username()` had no empty-result guard (unlike `generate_password()`). Added `[[ -z "${suffix}" ]] && die` check to prevent silent empty-suffix usernames when `/dev/urandom` is unavailable.
+
+### v1.1.5 — 2026-04-21
+- **Fix (Critical):** `systemctl_cmd` previously returned `0` when `systemctl` was absent, causing `|| die` callers to silently skip and `is-active` checks to report false positives. Now returns `127`. Added `systemctl_manage` wrapper that swallows `127` (graceful skip) for all enable/disable/start/stop/restart/reload calls, so `|| die` only fires on real systemctl failures. Status-check call-sites updated to distinguish exit codes `0` (active), `1` (inactive), and `127` (systemctl unavailable) and log appropriate messages.
+- **Fix (Critical):** Added `set -E` (`errtrace`) after `set -euo pipefail` so the ERR trap propagates correctly into functions and subshells. Without this, the `trap ... ERR` added in v1.1.4 only fired at the top level.
+- **Fix (Critical):** `--sample-data-rows` value was assigned without validation; a non-numeric value caused "integer expression expected" and aborted the script under strict mode. Parse-time regex check now rejects non-integer values immediately with a clear error.
+- **Fix (Critical):** `run_cmd()` debug logging wrote the full command including `--password=` arguments to the log file. Passwords are now redacted to `--password=***` in both the running and error log lines.
+- **Fix (Medium):** In non-interactive mode, "no install targets selected" now calls `die` (exit 1) instead of `exit 0`, preventing CI pipelines from treating a no-op run as success.
+- **Fix (Medium):** `generate_password()` now checks for an empty result and calls `die` if `/dev/urandom` is unavailable or `tr` produces no output, preventing silent empty-password database credentials.
+- **Fix (Medium):** ERR trap variables updated to use `${LINENO:-?}` and `${BASH_COMMAND:-unknown}` safe defaults.
+- **Fix (Medium):** `save_credential()` now uses `printf '%s=%q\n'` to shell-escape credential values, preventing file corruption when tokens or passwords contain spaces, quotes, or other shell metacharacters.
+- **Polish:** `WARN` log level now writes to stderr (`>&2`) alongside `ERROR`, making log parsing and CI pipeline output more reliable.
+
 ### v1.1.4 — 2026-04-21
 - **Fix:** Header comment `# Version` was mismatched with `SCRIPT_VERSION` constant (showed 1.1.2 instead of 1.1.3). Now kept in sync automatically on every version bump.
 - **Fix:** Unknown CLI arguments were only `log WARN` in all modes. In `--non-interactive` mode they now call `die`, preventing silent no-ops (e.g. a typo like `--install-myslq` silently doing nothing in CI/automation).
@@ -833,4 +857,4 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ---
 
-*Script: `opa_setup.sh` v1.1.4 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*
+*Script: `opa_setup.sh` v1.1.7 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*
