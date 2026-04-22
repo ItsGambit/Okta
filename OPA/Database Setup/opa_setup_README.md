@@ -89,7 +89,7 @@ Before running the script you need:
 
 1. **Root access** — run with `sudo bash opa_setup.sh` or as the `root` user directly.
 2. **Internet connectivity** — to reach:
-   - `packages.okta.com` (OPA repos)
+   - `dist.scaleft.com` (OPA repos)
    - `apt.postgresql.org` or `download.postgresql.org` (PostgreSQL)
    - Distribution mirrors (OS updates)
 3. **An Okta tenant with Privileged Access enabled.**
@@ -136,6 +136,14 @@ grep 'SCRIPT_VERSION=' opa_setup.sh
 # Expected: readonly SCRIPT_VERSION="1.1.8"
 ```
 
+### Make the script executable
+
+```bash
+chmod +x opa_setup.sh
+```
+
+This allows you to run the script directly as `./opa_setup.sh`. Both `./opa_setup.sh` and `sudo bash opa_setup.sh` are valid — the `chmod +x` step is required only for the `./` form.
+
 ---
 
 ## Quick Start
@@ -144,6 +152,9 @@ grep 'SCRIPT_VERSION=' opa_setup.sh
 # Download the script
 curl -fsSL "https://raw.githubusercontent.com/ItsGambit/Okta/main/OPA/Database%20Setup/opa_setup.sh" \
      -o opa_setup.sh
+
+# Make it executable
+chmod +x opa_setup.sh
 
 # Run interactively (recommended for first use)
 sudo bash opa_setup.sh
@@ -168,7 +179,7 @@ When run without `--non-interactive`, the script guides you through every step w
         1) OPA Agent
         2) OPA Gateway
         3) SQL Server  (sub-menu: MySQL or PostgreSQL)
-5.  OPA configuration   →  enter Okta team name and enrollment token(s)
+5.  OPA configuration   →  enter enrollment token(s) when prompted
 6.  DB seeding          →  enter how many sample rows to create
 7.  Firewall rules      →  automatic, based on components installed
 8.  Summary printed     →  path to credentials file shown
@@ -193,13 +204,12 @@ If one of the components is already present on the system, you will see:
 ## Non-Interactive Mode (Automation / CI)
 
 Pass `--non-interactive` and all relevant `--install-*` flags to run with zero prompts.
-Sensitive values (tokens, team name) are read from environment variables.
+Sensitive values (tokens) are read from environment variables.
 
 ### Basic example — install OPA Agent only
 
 ```bash
-sudo OPA_TEAM="my-okta-team" \
-     OPA_ENROLLMENT_TOKEN="ott_xxxxxxxxxxxxxxxxxxx" \
+sudo OPA_ENROLLMENT_TOKEN="ott_xxxxxxxxxxxxxxxxxxx" \
      bash opa_setup.sh \
      --non-interactive \
      --install-agent
@@ -208,8 +218,7 @@ sudo OPA_TEAM="my-okta-team" \
 ### Install Agent + PostgreSQL with 1,000 sample rows
 
 ```bash
-sudo OPA_TEAM="my-okta-team" \
-     OPA_ENROLLMENT_TOKEN="ott_xxxxxxxxxxxxxxxxxxx" \
+sudo OPA_ENROLLMENT_TOKEN="ott_xxxxxxxxxxxxxxxxxxx" \
      bash opa_setup.sh \
      --non-interactive \
      --install-agent \
@@ -220,8 +229,7 @@ sudo OPA_TEAM="my-okta-team" \
 ### Install Gateway + MySQL; force-reinstall if already present
 
 ```bash
-sudo OPA_TEAM="my-okta-team" \
-     OPA_GATEWAY_TOKEN="ogt_xxxxxxxxxxxxxxxxxxx" \
+sudo OPA_GATEWAY_TOKEN="ogt_xxxxxxxxxxxxxxxxxxx" \
      bash opa_setup.sh \
      --non-interactive \
      --install-gateway \
@@ -233,14 +241,14 @@ sudo OPA_TEAM="my-okta-team" \
 ### Install all four components
 
 ```bash
-sudo OPA_TEAM="my-okta-team" \
-     OPA_ENROLLMENT_TOKEN="ott_xxx" \
-     OPA_GATEWAY_TOKEN="ogt_xxx" \
+sudo OPA_ENROLLMENT_TOKEN="ott_xxxxxxxxxxxxxxxxxxx" \
+     OPA_GATEWAY_TOKEN="ogt_xxxxxxxxxxxxxxxxxxx" \
      bash opa_setup.sh \
      --non-interactive \
      --install-agent \
      --install-gateway \
      --install-mysql \
+     --install-postgresql \
      --sample-data-rows=200
 ```
 
@@ -261,7 +269,6 @@ sudo OPA_TEAM="my-okta-team" \
 | `--install-gateway` | Install the OPA Gateway | off |
 | `--install-mysql` | Install MySQL Server | off |
 | `--install-postgresql` | Install PostgreSQL Server | off |
-| `--opa-team=<TEAM>` | Okta PAM team/org name | `$OPA_TEAM` |
 | `--enrollment-token=<TOKEN>` | Agent enrollment token | `$OPA_ENROLLMENT_TOKEN` |
 | `--gateway-token=<TOKEN>` | Gateway enrollment token | `$OPA_GATEWAY_TOKEN` |
 | `--sample-data-rows=<N>` | Rows to seed into the DB | prompt / `100` in non-interactive |
@@ -274,7 +281,6 @@ These variables are read before prompting, so pre-setting them reduces interacti
 
 | Variable | Purpose |
 |----------|---------|
-| `OPA_TEAM` | Okta PAM team/org name (e.g., `"my-company"`) |
 | `OPA_ENROLLMENT_TOKEN` | Agent enrollment token from Okta admin console |
 | `OPA_GATEWAY_TOKEN` | Gateway enrollment token from Okta admin console |
 | `VERBOSE` | Set to `1` to enable debug output (same as `--verbose`) |
@@ -290,7 +296,7 @@ These variables are read before prompting, so pre-setting them reduces interacti
 | Package name | `scaleft-server-tools` |
 | Repository | `https://dist.scaleft.com/repos/` |
 | Config file | `/etc/sft/sftd.yaml` |
-| Log file | `journalctl -u sftd` or `/var/log/sftd.log` |
+| Log file | `journalctl -u sftd` (direct file logging depends on rsyslog configuration) |
 | Systemd service | `sftd` |
 
 **What the script does:**
@@ -316,17 +322,18 @@ https://help.okta.com/pam/en-us/content/topics/pam/agent-install.htm
 |------|--------|
 | Package name | `scaleft-gateway` |
 | Repository | `https://dist.scaleft.com/repos/` (shared with agent) |
-| Config file | `/etc/sft/sftd.yaml` |
-| Log file | `journalctl -u sftd` or `/var/log/sftd.log` |
-| Systemd service | `sftd` |
+| Config file | `/etc/sft/sft-gatewayd.yaml` |
+| Token file | `/var/lib/sft-gatewayd/setup.token` |
+| Log file | `journalctl -u sft-gatewayd` |
+| Systemd service | `sft-gatewayd` |
 | Listen port | `7234/TCP` (inbound — accepts connections from the OPA Client) |
 
 **What the script does:**
 1. Adds the Okta PAM repository (if not already added by the agent step).
-2. Installs `scaleft-gateway` (the `sftd` daemon starts automatically).
+2. Installs `scaleft-gateway` (the `sft-gatewayd` daemon starts automatically).
 3. Prompts for the Gateway Setup Token (created in Okta Admin > Privileged Access > Gateways > Create Token).
 4. Writes the token to `/var/lib/sft-gatewayd/setup.token` and creates `/etc/sft/sft-gatewayd.yaml` pointing to it.
-5. Restarts `sftd` to apply the configuration.
+5. Restarts `sft-gatewayd` to apply the configuration.
 6. Verifies the service is running.
 7. Opens port `7234/TCP` inbound via the system firewall.
 
@@ -454,10 +461,10 @@ The script runs with `set -euo pipefail`, meaning any unexpected error causes an
 
 | Flag set | What gets removed |
 |----------|-------------------|
-| OPA Agent started | `okta-pam-agent` package, config, and service |
-| OPA Gateway started | `okta-pam-adserver-gateway` package, config, and service |
+| OPA Agent started | `scaleft-server-tools` package, `/etc/sft/sftd.yaml`, `/var/lib/sftd/` |
+| OPA Gateway started | `scaleft-gateway` package, `/etc/sft/sft-gatewayd.yaml`, `/var/lib/sft-gatewayd/` |
 | MySQL started | `mysql-server` package, `/var/lib/mysql`, `/etc/mysql` |
-| PostgreSQL started | `postgresql*` packages, `/var/lib/postgresql`, `/etc/postgresql` |
+| PostgreSQL started | `postgresql-16` and related packages, `/var/lib/postgresql`, `/etc/postgresql` |
 
 > **Note:** Firewall rules opened before the failure are **not** rolled back, as removing them could break pre-existing connectivity. Remove them manually if needed.
 
@@ -483,12 +490,16 @@ After the script completes, all generated credentials are saved to:
 # =============================================================================
 # Okta Privilege Access Setup – Generated Credentials
 # Created   : Wed Apr 16 14:22:01 UTC 2026
+# Script    : opa_setup.sh v1.1.8
+# Log file  : /var/log/opa-setup/opa_setup_20260416_142201.log
 # =============================================================================
 
-OPA_AGENT_TEAM=my-okta-team
 OPA_AGENT_ENROLLMENT_TOKEN=ott_xxxxxxxxxxxxxxxxxxx
-OPA_AGENT_CONFIG=/etc/okta-pam-agent/okta-pam-agent.yaml
-OPA_AGENT_LOG=/var/log/okta-pam-agent/agent.log
+OPA_AGENT_TOKEN_FILE=/var/lib/sftd/enrollment.token
+
+OPA_GATEWAY_TOKEN=ogt_xxxxxxxxxxxxxxxxxxx
+OPA_GATEWAY_TOKEN_FILE=/var/lib/sft-gatewayd/setup.token
+OPA_GATEWAY_CONFIG=/etc/sft/sft-gatewayd.yaml
 
 MYSQL_ROOT_PASSWORD=Xk8#mP2qrN...
 MYSQL_ADMIN_USER=opaadmin_a1b2c3
@@ -514,7 +525,7 @@ Log entries are timestamped and severity-tagged:
 
 ```
 [2026-04-16 14:22:01] [INFO]    Installing Okta Privilege Access Agent...
-[2026-04-16 14:22:03] [SUCCESS] okta-pam-agent package installed.
+[2026-04-16 14:22:03] [SUCCESS] scaleft-server-tools package installed.
 [2026-04-16 14:22:04] [WARN]    Okta PAM Agent did not start cleanly. ...
 [2026-04-16 14:22:05] [ERROR]   Command failed (exit 1): ...
 ```
@@ -597,12 +608,17 @@ Pre-populated with: Engineering, Marketing, Sales, HR, Finance, Operations, Lega
 ### OPA Agent/Gateway not starting
 
 ```bash
-# Check the systemd service status
-sudo systemctl status okta-pam-agent
-sudo journalctl -u okta-pam-agent -n 50
+# Check OPA Agent service status
+sudo systemctl status sftd
+sudo journalctl -u sftd -n 50
 
-# Check the agent's own log
-sudo tail -f /var/log/okta-pam-agent/agent.log
+# Check OPA Gateway service status
+sudo systemctl status sft-gatewayd
+sudo journalctl -u sft-gatewayd -n 50
+
+# Follow logs in real time
+sudo journalctl -u sftd -f
+sudo journalctl -u sft-gatewayd -f
 ```
 
 **Common causes:**
@@ -675,20 +691,26 @@ The rollback trap should have cleaned up automatically. If it did not, review th
 
 ```bash
 # View the log to find what was installed
-sudo cat /var/log/opa-setup/opa_setup_<TIMESTAMP>.log | grep -E 'ROLLBACK|Installing|installed'
+grep -E 'ROLLBACK|Installing|installed' /var/log/opa-setup/opa_setup_<TIMESTAMP>.log
 
 # Manual uninstall — Ubuntu/Debian
-sudo apt-get purge -y okta-pam-agent okta-pam-adserver-gateway mysql-server postgresql-16
+sudo apt-get purge -y scaleft-server-tools scaleft-gateway mysql-server postgresql-16
+sudo rm -rf /etc/sft /var/lib/sftd /var/lib/sft-gatewayd \
+            /var/lib/mysql /etc/mysql \
+            /var/lib/postgresql /etc/postgresql
 
 # Manual uninstall — RHEL/Rocky
-sudo dnf remove -y okta-pam-agent okta-pam-adserver-gateway mysql-server postgresql16-server
+sudo dnf remove -y scaleft-server-tools scaleft-gateway mysql-server postgresql16-server
+sudo rm -rf /etc/sft /var/lib/sftd /var/lib/sft-gatewayd \
+            /var/lib/mysql /etc/mysql \
+            /var/lib/postgresql /var/lib/pgsql
 ```
 
 ### Package repository unreachable
 
 Verify network access:
 ```bash
-curl -v https://packages.okta.com/okta-pam-agent/gpg
+curl -v https://dist.scaleft.com/GPG-KEY-OktaPAM-2023
 curl -v https://www.postgresql.org/media/keys/ACCC4CF8.asc
 ```
 
@@ -712,7 +734,7 @@ sudo bash opa_setup.sh --skip-updates --force-reinstall --install-agent
 ## Frequently Asked Questions
 
 **Q: Does this script configure Okta Advanced Server Access (ASA)?**
-A: No. This script is specifically for the **Okta Privilege Access** product. The ASA `sft` agent is not installed or configured.
+A: No. This script is specifically for **Okta Privilege Access (OPA)**, not Okta Advanced Server Access (ASA). OPA uses the `sftd` and `sft-gatewayd` services from the `scaleft-server-tools` and `scaleft-gateway` packages — ASA uses the same underlying technology but is a separate product with a different admin console workflow. This script does not configure ASA.
 
 **Q: Can I install the Agent and Gateway on the same host?**
 A: Yes, though it is not recommended for production. The Agent manages access to the local host while the Gateway proxies access to other downstream resources. In production, the Gateway is typically a dedicated hardened VM.
@@ -720,13 +742,10 @@ A: Yes, though it is not recommended for production. The Agent manages access to
 **Q: Can I install both MySQL and PostgreSQL?**
 A: The install menu allows selecting only one SQL server at a time (they would both listen on default ports and could conflict). If you need both, run the script twice — once with `--install-mysql` and once with `--install-postgresql`.
 
-**Q: Where do I find my Okta PAM team name?**
-A: In your Okta Admin Console, navigate to *Security > Privileged Access*. The team name is shown in the URL: `https://<your-org>.okta.com/admin/pam/teams/<TEAM-NAME>`.
-
 **Q: The script says the package isn't found — what should I do?**
-A: Okta periodically updates package names. Check the current package name at:
+A: Okta periodically updates package names. Check the current package names at:
 https://help.okta.com/pam/en-us/content/topics/pam/agent-install.htm
-Update the `OPA_AGENT_SERVICE` and `OPA_GATEWAY_SERVICE` variables at the top of `opa_setup.sh`.
+Update the `OPA_AGENT_PACKAGE` and `OPA_GATEWAY_PACKAGE` constants at the top of `opa_setup.sh`.
 
 **Q: How do I run this in a Docker container or Kubernetes pod?**
 A: The script requires `systemd` for service management, which is not available in standard containers. For containerised OPA Agent deployments, refer to Okta's container-specific documentation.
