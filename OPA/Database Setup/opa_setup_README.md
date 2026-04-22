@@ -1,6 +1,6 @@
 # Okta Privilege Access (OPA) Setup Script
 
-**Version:** 1.1.3
+**Version:** 1.1.4
 **Script:** `opa_setup.sh`
 
 ---
@@ -136,7 +136,7 @@ After downloading, confirm the script version before running:
 
 ```bash
 grep 'SCRIPT_VERSION=' opa_setup.sh
-# Expected: readonly SCRIPT_VERSION="1.1.3"
+# Expected: readonly SCRIPT_VERSION="1.1.4"
 ```
 
 ---
@@ -741,6 +741,12 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ## Changelog
 
+### v1.1.4 — 2026-04-21
+- **Fix:** Header comment `# Version` was mismatched with `SCRIPT_VERSION` constant (showed 1.1.2 instead of 1.1.3). Now kept in sync automatically on every version bump.
+- **Fix:** Unknown CLI arguments were only `log WARN` in all modes. In `--non-interactive` mode they now call `die`, preventing silent no-ops (e.g. a typo like `--install-myslq` silently doing nothing in CI/automation).
+- **Fix:** All `systemctl` calls replaced with a new `systemctl_cmd` wrapper that gracefully no-ops with a `log WARN` when `systemctl` is not available (containers, WSL without systemd, minimal OS images). Previously any `systemctl` call on such a host would cause a hard failure.
+- **Fix:** Added an `ERR` trap in `main()` that logs the failing command and its line number (`line ${LINENO}: ${BASH_COMMAND}`) before the EXIT/rollback trap fires, making it significantly easier to diagnose failures under `set -euo pipefail`.
+
 ### v1.1.3 — 2026-04-21
 - **Fix:** All 8 heredocs using `<<-` syntax in the MySQL and PostgreSQL sections (root hardening, user creation, database creation, schema seeding) had space-indented bodies instead of tab-indented bodies. `<<-` only strips leading TABs — spaces are left intact, which would cause SQL to be sent with leading whitespace prepended to every statement. Converted all heredoc body indentation to tabs.
 
@@ -827,4 +833,4 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ---
 
-*Script: `opa_setup.sh` v1.1.3 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*
+*Script: `opa_setup.sh` v1.1.4 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*

@@ -18,7 +18,7 @@
 # Usage       : sudo bash opa_setup.sh [OPTIONS]
 #               Run  sudo bash opa_setup.sh --help  for full option list.
 #
-# Version     : 1.1.2
+# Version     : 1.1.4
 # =============================================================================
 
 set -euo pipefail
@@ -28,7 +28,7 @@ IFS=$'\n\t'
 # SECTION 1 – Global variables, constants, and logging bootstrap
 # ---------------------------------------------------------------------------
 
-readonly SCRIPT_VERSION="1.1.3"
+readonly SCRIPT_VERSION="1.1.4"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 readonly LOG_DIR="/var/log/opa-setup"
@@ -122,6 +122,17 @@ die() {
 }
 
 separator() { log INFO "------------------------------------------------------------"; }
+
+# Wrapper around systemctl that gracefully no-ops when systemd is unavailable
+# (containers, WSL without systemd, minimal OS images).
+# Usage: systemctl_cmd <subcommand> [args...]
+systemctl_cmd() {
+    if ! command -v systemctl &>/dev/null; then
+        log WARN "systemctl not available; skipping: systemctl $*"
+        return 0
+    fi
+    systemctl "$@"
+}
 
 # Called automatically on exit via trap.  Only performs rollback when the
 # exit code is non-zero (i.e. something failed).
@@ -321,7 +332,13 @@ parse_args() {
             --enrollment-token=*)   OPA_ENROLLMENT_TOKEN="${arg#*=}" ;;
             --gateway-token=*)      OPA_GATEWAY_TOKEN="${arg#*=}" ;;
             --sample-data-rows=*)   SAMPLE_DATA_ROWS="${arg#*=}" ;;
-            *)                      log WARN "Unknown argument: ${arg}. Use --help for usage." ;;
+            *)
+                if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+                    die "Unknown argument: ${arg}. Use --help for usage."
+                else
+                    log WARN "Unknown argument: ${arg}. Use --help for usage."
+                fi
+                ;;
         esac
     done
 }
@@ -473,7 +490,7 @@ is_installed() {
     esac
     # Fallback: check if binary/service exists
     command -v "${name}" &>/dev/null && return 0
-    systemctl list-units --type=service --all 2>/dev/null | grep -q "${name}" && return 0
+    systemctl_cmd list-units --type=service --all 2>/dev/null | grep -q "${name}" && return 0
     return 1
 }
 
@@ -489,7 +506,7 @@ get_installed_version() {
 get_service_status() {
     local svc="${1}"
     local status
-    status="$(systemctl is-active "${svc}" 2>/dev/null)" || status="inactive/not-found"
+    status="$(systemctl_cmd is-active "${svc}" 2>/dev/null)" || status="inactive/not-found"
     echo "${status}"
 }
 
@@ -514,9 +531,9 @@ uninstall_component() {
     local svc="${3}"
 
     log INFO "Uninstalling ${label}..."
-    if systemctl is-active --quiet "${svc}" 2>/dev/null; then
-        systemctl stop "${svc}"  || log WARN "Could not stop ${svc}."
-        systemctl disable "${svc}" || log WARN "Could not disable ${svc}."
+    if systemctl_cmd is-active --quiet "${svc}" 2>/dev/null; then
+        systemctl_cmd stop "${svc}"  || log WARN "Could not stop ${svc}."
+        systemctl_cmd disable "${svc}" || log WARN "Could not disable ${svc}."
     fi
 
     case "${PKG_MGR}" in
@@ -849,11 +866,11 @@ configure_opa_agent() {
     # sftd is enabled and started automatically by the package installer.
     # Restart to pick up the token file if the service already started.
     log INFO "Restarting ${OPA_AGENT_SERVICE} to apply enrollment token..."
-    systemctl restart "${OPA_AGENT_SERVICE}" || die "Failed to restart ${OPA_AGENT_SERVICE}."
+    systemctl_cmd restart "${OPA_AGENT_SERVICE}" || die "Failed to restart ${OPA_AGENT_SERVICE}."
 
     sleep 3
 
-    if systemctl is-active --quiet "${OPA_AGENT_SERVICE}"; then
+    if systemctl_cmd is-active --quiet "${OPA_AGENT_SERVICE}"; then
         log SUCCESS "${OPA_AGENT_SERVICE} is running."
     else
         log WARN "${OPA_AGENT_SERVICE} did not start cleanly. Check: journalctl -u ${OPA_AGENT_SERVICE}"
@@ -945,11 +962,11 @@ EOF
     log SUCCESS "Gateway configuration written to ${gw_config_file}"
 
     log INFO "Restarting ${OPA_GATEWAY_SERVICE} to apply configuration..."
-    systemctl restart "${OPA_GATEWAY_SERVICE}" || die "Failed to restart ${OPA_GATEWAY_SERVICE}."
+    systemctl_cmd restart "${OPA_GATEWAY_SERVICE}" || die "Failed to restart ${OPA_GATEWAY_SERVICE}."
 
     sleep 3
 
-    if systemctl is-active --quiet "${OPA_GATEWAY_SERVICE}"; then
+    if systemctl_cmd is-active --quiet "${OPA_GATEWAY_SERVICE}"; then
         log SUCCESS "${OPA_GATEWAY_SERVICE} is running."
     else
         log WARN "${OPA_GATEWAY_SERVICE} did not start cleanly. Check: journalctl -u ${OPA_GATEWAY_SERVICE}"
@@ -970,14 +987,14 @@ uninstall_mysql() {
     log INFO "Uninstalling MySQL..."
     case "${PKG_MGR}" in
         apt)
-            systemctl stop mysql 2>/dev/null || true
+            systemctl_cmd stop mysql 2>/dev/null || true
             DEBIAN_FRONTEND=noninteractive apt-get purge -y mysql-server mysql-client mysql-common \
                 "mysql-server-*" "mysql-client-*" 2>&1 | tee -a "${LOG_FILE}"
             DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>&1 | tee -a "${LOG_FILE}"
             rm -rf /etc/mysql /var/lib/mysql /var/log/mysql
             ;;
         dnf|yum)
-            systemctl stop mysqld 2>/dev/null || true
+            systemctl_cmd stop mysqld 2>/dev/null || true
             ${PKG_MGR} remove -y mysql-server mysql 2>&1 | tee -a "${LOG_FILE}"
             rm -rf /var/lib/mysql /var/log/mysql /etc/my.cnf.d
             ;;
@@ -1014,16 +1031,16 @@ install_mysql() {
 
     # Determine correct service name (varies by distro)
     local mysql_svc="mysql"
-    if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^mysqld.service"; then
+    if systemctl_cmd list-unit-files --type=service 2>/dev/null | grep -q "^mysqld.service"; then
         mysql_svc="mysqld"
     fi
 
     log INFO "Enabling and starting MySQL..."
-    systemctl enable "${mysql_svc}"
-    systemctl start  "${mysql_svc}" || die "Failed to start MySQL."
+    systemctl_cmd enable "${mysql_svc}"
+    systemctl_cmd start  "${mysql_svc}" || die "Failed to start MySQL."
     sleep 2
 
-    if ! systemctl is-active --quiet "${mysql_svc}"; then
+    if ! systemctl_cmd is-active --quiet "${mysql_svc}"; then
         die "MySQL failed to start. Check: journalctl -u ${mysql_svc}"
     fi
     log SUCCESS "MySQL is running."
@@ -1135,7 +1152,7 @@ slow_query_log_file=/var/log/mysql/slow.log
 long_query_time=2
 EOF
 
-    systemctl restart "${mysql_svc}" || log WARN "MySQL restart failed after applying hardening config."
+    systemctl_cmd restart "${mysql_svc}" || log WARN "MySQL restart failed after applying hardening config."
     log SUCCESS "MySQL hardening configuration applied."
 
     save_credential "MYSQL_ROOT_PASSWORD"   "${MYSQL_ROOT_PASSWORD}"
@@ -1238,13 +1255,13 @@ uninstall_postgresql() {
     log INFO "Uninstalling PostgreSQL..."
     case "${PKG_MGR}" in
         apt)
-            systemctl stop postgresql 2>/dev/null || true
+            systemctl_cmd stop postgresql 2>/dev/null || true
             DEBIAN_FRONTEND=noninteractive apt-get purge -y postgresql postgresql-* 2>&1 | tee -a "${LOG_FILE}"
             DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>&1 | tee -a "${LOG_FILE}"
             rm -rf /etc/postgresql /var/lib/postgresql /var/log/postgresql
             ;;
         dnf|yum)
-            systemctl stop postgresql 2>/dev/null || true
+            systemctl_cmd stop postgresql 2>/dev/null || true
             ${PKG_MGR} remove -y postgresql-server postgresql 2>&1 | tee -a "${LOG_FILE}"
             rm -rf /var/lib/pgsql
             ;;
@@ -1360,17 +1377,17 @@ https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
     # Determine service name
     local pg_svc="postgresql"
     local found_svc
-    found_svc="$(systemctl list-unit-files --type=service 2>/dev/null \
+    found_svc="$(systemctl_cmd list-unit-files --type=service 2>/dev/null \
         | grep "^postgresql-[0-9]" | awk '{print $1}' | head -1)"
     found_svc="${found_svc%.service}"
     [[ -n "${found_svc}" ]] && pg_svc="${found_svc}"
 
     log INFO "Enabling and starting ${pg_svc}..."
-    systemctl enable "${pg_svc}"
-    systemctl start  "${pg_svc}" || die "Failed to start PostgreSQL."
+    systemctl_cmd enable "${pg_svc}"
+    systemctl_cmd start  "${pg_svc}" || die "Failed to start PostgreSQL."
     sleep 2
 
-    if ! systemctl is-active --quiet "${pg_svc}"; then
+    if ! systemctl_cmd is-active --quiet "${pg_svc}"; then
         die "PostgreSQL failed to start. Check: journalctl -u ${pg_svc}"
     fi
     log SUCCESS "PostgreSQL is running (service: ${pg_svc})."
@@ -1474,7 +1491,7 @@ EOF
         chown postgres:postgres "${hba_conf}"
         chmod 600 "${hba_conf}"
 
-        systemctl reload "${pg_svc}" || log WARN "PostgreSQL reload failed."
+        systemctl_cmd reload "${pg_svc}" || log WARN "PostgreSQL reload failed."
         log SUCCESS "PostgreSQL hardening configuration applied."
     else
         log WARN "Could not locate PostgreSQL data directory; skipping hardening config."
@@ -1574,7 +1591,7 @@ configure_firewall() {
                     || log WARN "ufw: failed to open ${port}/tcp (${label})."
                 ;;
             firewalld)
-                if systemctl is-active --quiet firewalld 2>/dev/null; then
+                if systemctl_cmd is-active --quiet firewalld 2>/dev/null; then
                     firewall-cmd --permanent --add-port="${port}/tcp" \
                         || log WARN "firewalld: failed to open ${port}/tcp (${label})."
                 else
@@ -1739,6 +1756,10 @@ check_root() {
 main() {
     # Parse CLI arguments first so flags affect all subsequent steps
     parse_args "$@"
+
+    # ERR trap – logs the failing command and line number before the EXIT trap fires.
+    # shellcheck disable=SC2154
+    trap 'log ERROR "Command failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 
     # Register rollback trap – fires on any non-zero exit
     trap 'rollback_on_error $?' EXIT
