@@ -1,6 +1,6 @@
 # Okta Privilege Access (OPA) Setup Script
 
-**Version:** 1.1.1
+**Version:** 1.1.3
 **Script:** `opa_setup.sh`
 
 ---
@@ -136,7 +136,7 @@ After downloading, confirm the script version before running:
 
 ```bash
 grep 'SCRIPT_VERSION=' opa_setup.sh
-# Expected: readonly SCRIPT_VERSION="1.1.1"
+# Expected: readonly SCRIPT_VERSION="1.1.3"
 ```
 
 ---
@@ -741,6 +741,12 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ## Changelog
 
+### v1.1.3 — 2026-04-21
+- **Fix:** All 8 heredocs using `<<-` syntax in the MySQL and PostgreSQL sections (root hardening, user creation, database creation, schema seeding) had space-indented bodies instead of tab-indented bodies. `<<-` only strips leading TABs — spaces are left intact, which would cause SQL to be sent with leading whitespace prepended to every statement. Converted all heredoc body indentation to tabs.
+
+### v1.1.2 — 2026-04-21
+- **Fix:** `configure_opa_gateway` now copies `/etc/sft/sft-gatewayd.sample.yaml` to `/etc/sft/sft-gatewayd.yaml` as the base config (instead of writing a blank file), then appends `SetupTokenFile` and the `Orchestrator` block (`Enabled: true`, `BinaryPath: /usr/sbin/sft-orchestrator`) as required for gateway operation.
+
 ### v1.1.1 — 2026-04-21
 - **Fix (Critical):** `OPA_GATEWAY_SERVICE` was incorrectly set to `sftd` (same as the agent). Corrected to `sft-gatewayd` — the actual systemd service name for `scaleft-gateway` per Okta gateway documentation. This prevented gateway service management (start/stop/restart/uninstall) from working correctly and would have caused conflicts when both agent and gateway were installed on the same host.
 - **Fix:** Non-interactive mode now fails immediately with a clear error if `OPA_ENROLLMENT_TOKEN` or `OPA_GATEWAY_TOKEN` is not provided, instead of silently writing an empty token file.
@@ -821,4 +827,4 @@ A: The rollback uses the same uninstall functions as the `--force-reinstall` pat
 
 ---
 
-*Script: `opa_setup.sh` v1.1.1 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*
+*Script: `opa_setup.sh` v1.1.3 — https://github.com/ItsGambit/Okta/blob/main/OPA/Database%20Setup/opa_setup.sh*
