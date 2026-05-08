@@ -10,6 +10,7 @@ The script handles vendor repo setup, service configuration, security hardening,
 
 - [Supported Operating Systems](#supported-operating-systems)
 - [Prerequisites](#prerequisites)
+- [Download](#download)
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
 - [Modes](#modes)
@@ -50,6 +51,21 @@ The following must be satisfied before running the script:
 | Ports              | 3306 (MySQL), 5432 (PostgreSQL), 27017 (MongoDB) must be free       |
 
 > **Note:** The script automatically runs a full OS package upgrade (`apt-get upgrade` / `dnf upgrade` / etc.) before installing databases, and checks for a pending reboot. If a reboot is required (e.g. after a kernel update), the script warns you — in interactive mode it prompts to abort so you can reboot first.
+
+---
+
+## Download
+
+```bash
+# curl
+curl -fsSL "https://raw.githubusercontent.com/ItsGambit/Okta/main/OPA/All-in-One%20Database%20Server%20Setup/db-install.sh" -o db-install.sh
+
+# wget
+wget -q "https://raw.githubusercontent.com/ItsGambit/Okta/main/OPA/All-in-One%20Database%20Server%20Setup/db-install.sh" -O db-install.sh
+
+# Make executable
+chmod +x db-install.sh
+```
 
 ---
 
