@@ -20,6 +20,7 @@ The script handles vendor repo setup, service configuration, security hardening,
 - [Output Files](#output-files)
 - [OPA Service Accounts](#opa-service-accounts)
 - [Rollback](#rollback)
+- [Re-Running the Script](#re-running-the-script)
 - [Examples](#examples)
 - [Changelog](#changelog)
 
@@ -360,6 +361,35 @@ In interactive mode, you will be asked to confirm. The rollback detects which da
 
 ---
 
+## Re-Running the Script
+
+The script is safe to re-run at any time — against a fresh server, after a failed install, or over a previously completed installation.
+
+### How previous runs are detected
+
+Immediately after OS detection (before any package operations), the script checks for an existing log file at the configured `--log-file` path (default: `/var/log/db-install.log`). If found, it inspects the file:
+
+| Log file state | Detected as | Action |
+|----------------|-------------|--------|
+| No log file exists | First run | Proceeds normally — no cleanup |
+| Log contains `INSTALLATION COMPLETE` | Successful previous run | Interactive: prompts to confirm reinstall. Non-interactive: logs a warning and proceeds |
+| Log exists but no completion marker | Failed / interrupted run | Cleans up silently without prompting |
+| Log file unreadable (permissions / I/O error) | Treated as failed run | Logs a warning and cleans up |
+
+### What the cleanup does
+
+When a previous run is detected, **all three database engines are cleaned up** regardless of which ones were originally installed. This ensures a truly clean slate:
+
+1. Stops `mysql`, `postgresql`, and `mongod` services (errors silently ignored)
+2. Purges all engine packages for the active distro family (apt purge / dnf remove / zypper remove)
+3. On Debian/Ubuntu: runs `apt-get autoremove` and `dpkg --configure -a` to clear any half-configured sub-packages
+4. Removes data and config directories: `/var/lib/mysql`, `/etc/mysql`, `/var/lib/postgresql`, `/var/lib/pgsql`, `/etc/postgresql`, `/var/lib/mongodb`, `/var/log/mongodb`, `/etc/mongod.conf`
+5. Archives the old log file with a timestamp suffix (e.g. `/var/log/db-install.log.20260507_143022.bak`) so no run history is lost
+
+> **Warning:** Cleanup is **destructive and irreversible**. All database data in the above directories will be permanently removed. Ensure data is backed up before re-running on a server with existing data.
+
+---
+
 ## Examples
 
 ```bash
@@ -409,6 +439,33 @@ sudo bash db-install.sh --rollback
 ---
 
 ## Changelog
+
+### v1.3.7
+
+**Security fixes**
+- Fixed (CRITICAL): MySQL root password was passed via `-p${MYSQL_ROOT_PW}` on the command line in `create_mysql_opa_user()`, `create_mysql_lab_admin()`, and `seed_mysql_data()` — visible in `ps aux` output and susceptible to shell word-splitting. Replaced with `MYSQL_PWD` environment variable which keeps the password off the command line
+- Fixed (CRITICAL): All `mongosh` invocations passed `-p "${MONGO_ADMIN_PW}"` as a command-line argument — visible in `ps aux` to any user on the system. Added `mongosh_admin_eval()` helper that writes admin credentials to a `chmod 600` temp file and calls `mongosh --nodb --file`, so no password ever appears on the command line. Applied to `create_mongo_opa_user()`, `create_mongo_lab_admin()`, `seed_mongodb_data()` (both user-creation and batch-insert calls), and the initial admin-creation call in `configure_mongodb()`
+
+**Correctness fixes**
+- Fixed (CRITICAL): `write_credentials()` always printed `[MONGODB 7.x]` as the section header regardless of which version was actually installed. Added `MONGO_INSTALLED_VERSION` global (set by `install_mongodb()` after version selection) so the credential file now correctly reflects `[MONGODB 8.x]` on all distros except Amazon Linux 2, which installs 7.0
+- Fixed (HIGH): `_detect_previous_run_status()` did not distinguish between `grep` exit code 1 (pattern not found) and exit code 2 (file unreadable / I/O error). Both were silently treated as "failed previous run". The function now logs a warning when `grep` returns code 2 so permission or I/O errors are visible in the log
+- Fixed (HIGH): `wait_for_tcp_port()` had an off-by-one — the final check at exactly `max_wait` seconds was never performed because the loop exited before the last port probe. Refactored to `while true` with an explicit `[[ elapsed -ge max_wait ]] && break` guard after a failed probe, ensuring the port is checked once more at the timeout boundary
+- Fixed (HIGH): `write_credentials()` iterated seeded DB arrays with `IFS=':' read -r dbn dbu dbp` without validating entry format first. A malformed `db:user:pw` entry would produce empty or partial output silently. Each iteration now validates the entry matches `db:user:pw` before splitting; malformed entries emit a `log_warn` and are skipped
+
+**Documentation**
+- Added "Re-Running the Script" section to the README describing previous-run detection logic, all three detection states, full scope of the cleanup (services, packages, data directories, log archival), and a destructive-data warning
+
+### v1.3.6
+
+- Added: Previous-run detection at startup — script checks for an existing log file immediately after OS detection, before prerequisites or package installs. If found, determines outcome: `INSTALLATION COMPLETE` = successful prior run (prompts in interactive mode, warns and continues in non-interactive); anything else = failed/interrupted run (cleans up automatically without prompting)
+- Added: `cleanup_previous_install()` — stops all database services, purges all packages (MySQL, PostgreSQL, MongoDB) for the active distro family, removes all data/config directories, runs `dpkg --configure -a` on Debian/Ubuntu, and archives the old log file with a timestamp before the new run begins
+- Improved: Per-engine pre-purge blocks inside `install_mysql()`, `install_postgresql()`, and `install_mongodb()` removed — superseded by the centralised startup cleanup which is more logical and runs only when a previous run is actually detected
+
+### v1.3.5
+
+- Fixed: `E: Sub-process /usr/bin/dpkg returned an error code (1)` on re-install — applied consistently to all three engines (MySQL, PostgreSQL, MongoDB). Previous rollbacks purged top-level packages but left sub-packages (`mysql-common`, `mysql-community-*-core`, `postgresql-common`, `postgresql-client-common`, `mongodb-mongosh`, `mongodb-database-tools`, etc.) in a half-configured dpkg state. Each `install_*()` function now runs a full pre-install purge of all known sub-packages, `apt-get autoremove`, and `dpkg --configure -a` before attempting a fresh install — making the script fully idempotent and safe to re-run after any failure or rollback
+- Fixed: Package install failures for all three engines are now caught with `|| return 1` so a dpkg error triggers rollback instead of silently continuing to `systemctl enable --now`
+- Fixed: Rollback for all three engines now purges the full set of sub-packages and data directories so subsequent re-runs always start from a clean state
 
 ### v1.3.4
 

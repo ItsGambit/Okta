@@ -7,7 +7,7 @@
 #                Creates an OPA service account in each database (MySQL +
 #                PostgreSQL) for use with the OPA Database Gateway JIT feature.
 #
-# Version      : 1.3.4
+# Version      : 1.3.7
 # Supported OS : Ubuntu 20.04 / 22.04 / 24.04
 #                Debian 11 (bullseye) / 12 (bookworm)
 #                RHEL 8 / 9
@@ -68,7 +68,7 @@ set -uo pipefail    # Strict mode: treat unset vars as errors, propagate pipe fa
 # SECTION 1: CONSTANTS & VERSION
 # ==============================================================================
 
-readonly SCRIPT_VERSION="1.3.4"
+readonly SCRIPT_VERSION="1.3.7"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_START_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 readonly SCRIPT_PID="$$"
@@ -103,6 +103,9 @@ MYSQL_ADMIN_PW=""
 PG_ADMIN_PW=""
 MONGO_ADMIN_PW=""
 OPA_SVC_PW=""
+
+# Populated by install_mongodb() — used by write_credentials() to label the version
+MONGO_INSTALLED_VERSION=""
 
 # Seeding (disabled by default)
 SEED_DATA=false
@@ -615,6 +618,119 @@ check_reboot_required() {
   fi
 }
 
+# Check whether a previous run of this script has left any trace.
+# Returns:
+#   0 — log file exists and contains "INSTALLATION COMPLETE" (successful previous run)
+#   1 — no log file (first run)
+#   2 — log file exists but no completion marker (failed / interrupted previous run)
+_detect_previous_run_status() {
+  [[ ! -f "$LOG_FILE" ]] && return 1
+  local grep_rc
+  grep -q '\[STEP\].*INSTALLATION COMPLETE' "$LOG_FILE" 2>/dev/null
+  grep_rc=$?
+  if [[ $grep_rc -eq 0 ]]; then
+    return 0   # successful previous run
+  elif [[ $grep_rc -eq 2 ]]; then
+    log_warn "Could not read log file '${LOG_FILE}' (permission or I/O error) — treating as failed previous run"
+    return 2
+  else
+    return 2   # pattern not found = failed / interrupted previous run
+  fi
+}
+
+# If a previous run is detected, stop all database services, purge all packages,
+# and remove data directories so the fresh install starts from a clean slate.
+# On a successful previous install, prompts the user before wiping (interactive)
+# or logs a warning and continues (non-interactive).
+# Archives the old log file before beginning so no run history is lost.
+cleanup_previous_install() {
+  local status
+  _detect_previous_run_status; status=$?
+  [[ $status -eq 1 ]] && return 0   # first run — nothing to clean up
+
+  if [[ $status -eq 0 ]]; then
+    log_warn "A previous SUCCESSFUL installation was detected (log: ${LOG_FILE})."
+    if [[ "$INTERACTIVE" == "true" ]]; then
+      if ! confirm "Re-running will stop and reinstall all databases. Continue?"; then
+        log_info "Aborting."; exit 0
+      fi
+    else
+      log_warn "Non-interactive mode: proceeding with reinstall over previous installation."
+    fi
+  else
+    log_warn "Previous run was incomplete or failed — cleaning up before fresh install."
+  fi
+
+  # Archive old log before cleanup so run history is preserved
+  local archive="${LOG_FILE}.$(date +%Y%m%d_%H%M%S).bak"
+  mv "$LOG_FILE" "$archive" 2>/dev/null || true
+  log_info "Previous log archived: ${archive}"
+
+  # Stop all database services (non-fatal — service may not exist)
+  log_info "Stopping any running database services…"
+  for svc in mysql mysqld mongod postgresql "postgresql-${PG_VERSION}"; do
+    systemctl stop "$svc" 2>/dev/null || true
+  done
+
+  # Purge packages per distro family
+  case "$DISTRO_FAMILY" in
+    debian)
+      log_info "Purging MySQL packages…"
+      DEBIAN_FRONTEND=noninteractive apt-get purge -y \
+        mysql-server mysql-community-server mysql-community-client \
+        mysql-community-client-core mysql-community-server-core \
+        mysql-common mysql-client 2>/dev/null || true
+
+      log_info "Purging PostgreSQL packages…"
+      DEBIAN_FRONTEND=noninteractive apt-get purge -y \
+        "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}" \
+        postgresql-common postgresql-client-common 2>/dev/null || true
+
+      log_info "Purging MongoDB packages…"
+      DEBIAN_FRONTEND=noninteractive apt-get purge -y \
+        mongodb-org mongodb-org-server mongodb-org-mongos mongodb-org-shell \
+        mongodb-org-tools mongodb-org-database mongodb-org-database-tools-extra \
+        mongodb-mongosh mongodb-database-tools 2>/dev/null || true
+
+      apt-get autoremove -y 2>/dev/null || true
+      dpkg --configure -a 2>/dev/null || true
+      ;;
+
+    rhel)
+      log_info "Removing MySQL packages…"
+      "$PKG_MANAGER" remove -y mysql-community-server mysql-community-client \
+        mysql-community-common 2>/dev/null || true
+
+      log_info "Removing PostgreSQL packages…"
+      "$PKG_MANAGER" remove -y "postgresql${PG_VERSION}-server" \
+        "postgresql${PG_VERSION}" 2>/dev/null || true
+
+      log_info "Removing MongoDB packages…"
+      "$PKG_MANAGER" remove -y mongodb-org 2>/dev/null || true
+      ;;
+
+    suse)
+      log_info "Removing MySQL packages…"
+      zypper remove -y mysql-community-server 2>/dev/null || true
+
+      log_info "Removing PostgreSQL packages…"
+      zypper remove -y "postgresql${PG_VERSION}-server" \
+        "postgresql${PG_VERSION}" 2>/dev/null || true
+
+      log_info "Removing MongoDB packages…"
+      zypper remove -y mongodb-org 2>/dev/null || true
+      ;;
+  esac
+
+  # Remove data and config directories (all distros)
+  log_info "Removing database data and configuration directories…"
+  rm -rf /var/lib/mysql /etc/mysql 2>/dev/null || true
+  rm -rf /var/lib/postgresql /var/lib/pgsql /etc/postgresql 2>/dev/null || true
+  rm -rf /var/lib/mongodb /var/log/mongodb /etc/mongod.conf 2>/dev/null || true
+
+  log_info "Cleanup of previous installation complete."
+}
+
 # ==============================================================================
 # SECTION 10: PACKAGE MANAGER ABSTRACTION
 # ==============================================================================
@@ -692,7 +808,10 @@ install_mysql() {
       fi
       run_cmd env DEBIAN_FRONTEND=noninteractive dpkg -i "$apt_config_deb"
       pm_update
-      run_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
+      run_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server || {
+        log_error "MySQL package installation failed — check apt output above for details."
+        return 1
+      }
       MYSQL_SERVICE="mysql"
       ;;
 
@@ -742,9 +861,13 @@ install_mysql() {
   [[ "$DRY_RUN" != "true" ]] && { wait_for_tcp_port 127.0.0.1 3306 || return 1; }
   log_info "MySQL service '${MYSQL_SERVICE}' enabled and started."
 
-  # Register rollback: stop + purge MySQL + wipe data directory
+  # Register rollback: stop + purge all MySQL packages (including sub-packages
+  # that apt-get autoremove may miss) + wipe data directory for a clean slate
   push_rollback "systemctl stop ${MYSQL_SERVICE} 2>/dev/null || true; \
-    pm_remove mysql-server mysql-community-server mysql-community-client 2>/dev/null || true; \
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y mysql-server mysql-community-server \
+      mysql-community-client mysql-community-client-core mysql-community-server-core \
+      mysql-common mysql-client 2>/dev/null || true; \
+    apt-get autoremove -y 2>/dev/null || true; \
     rm -rf /var/lib/mysql /etc/mysql"
 }
 
@@ -843,7 +966,8 @@ SQL
   if [[ "$DRY_RUN" == "true" ]]; then
     log_dry "Would create MySQL opa_svc user"
   else
-    echo "$sql" | mysql -u root "-p${MYSQL_ROOT_PW}" 2>&1 | tee -a "$LOG_FILE" || {
+    # MYSQL_PWD avoids passing the password on the command line (hidden from ps)
+    MYSQL_PWD="${MYSQL_ROOT_PW}" mysql -u root 2>&1 <<< "$sql" | tee -a "$LOG_FILE" || {
       log_error "Failed to create MySQL opa_svc user."
       return 1
     }
@@ -868,7 +992,10 @@ install_postgresql() {
       echo "deb [signed-by=${pgdg_key}] https://apt.postgresql.org/pub/repos/apt ${OS_CODENAME}-pgdg main" \
         | run_cmd tee /etc/apt/sources.list.d/pgdg.list > /dev/null
       pm_update
-      pm_install "postgresql-${PG_VERSION}"
+      pm_install "postgresql-${PG_VERSION}" || {
+        log_error "PostgreSQL package installation failed."
+        return 1
+      }
       PG_SERVICE="postgresql"
       PG_DATA_DIR="/var/lib/postgresql/${PG_VERSION}/main"
       PG_HBA_CONF="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
@@ -937,8 +1064,11 @@ install_postgresql() {
   log_info "PostgreSQL service '${PG_SERVICE}' enabled and started."
 
   push_rollback "systemctl stop ${PG_SERVICE} 2>/dev/null || true; \
-    pm_remove postgresql${PG_VERSION}-server postgresql${PG_VERSION} postgresql-${PG_VERSION} 2>/dev/null || true; \
-    rm -rf /var/lib/postgresql /var/lib/pgsql"
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y \
+      postgresql-${PG_VERSION} postgresql-client-${PG_VERSION} \
+      postgresql-common postgresql-client-common 2>/dev/null || true; \
+    apt-get autoremove -y 2>/dev/null || true; \
+    rm -rf /var/lib/postgresql /var/lib/pgsql /etc/postgresql"
 }
 
 configure_postgresql() {
@@ -1028,10 +1158,13 @@ wait_for_tcp_port() {
   local host="$1" port="$2" max_wait="${3:-30}"
   local elapsed=0
   log_info "Waiting for ${host}:${port} to be ready…"
-  while [[ $elapsed -lt $max_wait ]]; do
+  while true; do
     if (: >/dev/tcp/${host}/${port}) 2>/dev/null; then
       log_info "${host}:${port} ready (${elapsed}s elapsed)."
       return 0
+    fi
+    if [[ $elapsed -ge $max_wait ]]; then
+      break
     fi
     sleep 1
     (( elapsed++ ))
@@ -1040,12 +1173,37 @@ wait_for_tcp_port() {
   return 1
 }
 
+# Run a mongosh JavaScript snippet authenticated as the MongoDB admin user.
+# Admin credentials are written to a chmod-600 temp file; mongosh is invoked
+# with --nodb --file so NO password ever appears on the command line or in
+# `ps aux` output.  The snippet receives a pre-connected `db` variable pointing
+# at the admin database.  Values embedded in the snippet must be pre-escaped
+# with escape_js() to prevent JavaScript injection.
+#   Usage: mongosh_admin_eval "js_snippet"
+mongosh_admin_eval() {
+  local js_body="$1"
+  local js_file="${TEMP_DIR}/mongosh_eval_${RANDOM}.js"
+  local esc_pw; esc_pw="$(escape_js "$MONGO_ADMIN_PW")"
+  cat > "$js_file" <<JSEOF
+const __conn = new Mongo('127.0.0.1:27017');
+__conn.getDB('admin').auth('admin', '${esc_pw}');
+let db = __conn.getDB('admin');
+${js_body}
+JSEOF
+  chmod 600 "$js_file"
+  mongosh --nodb --quiet --file "$js_file" 2>&1 | tee -a "$LOG_FILE"
+  local __rc=$?
+  rm -f "$js_file"
+  return $__rc
+}
+
 install_mongodb() {
   # MongoDB 8.0 is the current latest stable release (October 2024+).
   # Amazon Linux 2 (CentOS 7-based) does not have MongoDB 8.0 packages;
   # AL2 falls back to 7.0 (last version with AL2 support). AL2023 uses 8.0.
   local mongo_version="8.0"
   [[ "$OS_ID" == "amzn" && "$OS_VERSION" == "2" ]] && mongo_version="7.0"
+  MONGO_INSTALLED_VERSION="$mongo_version"   # expose for write_credentials()
   log_step "Installing MongoDB ${mongo_version} (from official MongoDB repo)"
 
   case "$DISTRO_FAMILY" in
@@ -1060,7 +1218,10 @@ install_mongodb() {
 https://repo.mongodb.org/apt/${OS_ID} ${OS_CODENAME}/mongodb-org/${mongo_version} multiverse" \
         | run_cmd tee /etc/apt/sources.list.d/mongodb-org-${mongo_version}.list > /dev/null
       pm_update
-      pm_install mongodb-org
+      pm_install mongodb-org || {
+        log_error "MongoDB package installation failed."
+        return 1
+      }
       ;;
 
     rhel)
@@ -1124,35 +1285,46 @@ REPOEOF
   log_info "MongoDB service '${MONGO_SERVICE}' enabled and started."
 
   push_rollback "systemctl stop ${MONGO_SERVICE} 2>/dev/null || true; \
-    pm_remove mongodb-org mongodb-org-server mongodb-org-shell mongodb-org-mongos mongodb-org-tools 2>/dev/null || true; \
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y \
+      mongodb-org mongodb-org-server mongodb-org-mongos mongodb-org-shell \
+      mongodb-org-tools mongodb-org-database mongodb-org-database-tools-extra \
+      mongodb-mongosh mongodb-database-tools 2>/dev/null || true; \
+    apt-get autoremove -y 2>/dev/null || true; \
     rm -rf /var/lib/mongodb /var/log/mongodb /etc/mongod.conf"
 }
 
 configure_mongodb() {
   log_step "Configuring MongoDB (creating admin user then enabling authentication)"
 
-  # Step 1: Create the admin user BEFORE enabling auth (no-auth connection)
+  # Step 1: Create the admin user BEFORE enabling auth (no-auth connection).
+  # JS is written to a temp file so the password never appears on the command
+  # line or in ps output.
   if [[ "$DRY_RUN" == "true" ]]; then
     log_dry "Would create MongoDB admin user via mongosh"
   else
     local esc_admin_pw; esc_admin_pw="$(escape_js "$MONGO_ADMIN_PW")"
-    run_cmd mongosh --quiet --eval "
-      db = db.getSiblingDB('admin');
-      if (db.getUser('admin') == null) {
-        db.createUser({
-          user: 'admin',
-          pwd: '${esc_admin_pw}',
-          roles: [{ role: 'root', db: 'admin' }]
-        });
-        print('MongoDB admin user created.');
-      } else {
-        db.updateUser('admin', { pwd: '${esc_admin_pw}' });
-        print('MongoDB admin user updated.');
-      }
-    " 2>&1 | tee -a "$LOG_FILE" || {
+    local js_file="${TEMP_DIR}/mongosh_admin_init.js"
+    cat > "$js_file" <<JSEOF
+db = db.getSiblingDB('admin');
+if (db.getUser('admin') == null) {
+  db.createUser({
+    user: 'admin',
+    pwd: '${esc_admin_pw}',
+    roles: [{ role: 'root', db: 'admin' }]
+  });
+  print('MongoDB admin user created.');
+} else {
+  db.updateUser('admin', { pwd: '${esc_admin_pw}' });
+  print('MongoDB admin user updated.');
+}
+JSEOF
+    chmod 600 "$js_file"
+    run_cmd mongosh --quiet --file "$js_file" 2>&1 | tee -a "$LOG_FILE" || {
       log_error "Failed to create MongoDB admin user."
+      rm -f "$js_file"
       return 1
     }
+    rm -f "$js_file"
   fi
 
   # Step 2: Enable authentication in mongod.conf
@@ -1194,11 +1366,8 @@ create_mongo_opa_user() {
   if [[ "$DRY_RUN" == "true" ]]; then
     log_dry "Would create MongoDB opa_svc user"
   else
-    local esc_admin_pw; esc_admin_pw="$(escape_js "$MONGO_ADMIN_PW")"
-    local esc_opa_pw;   esc_opa_pw="$(escape_js "$OPA_SVC_PW")"
-    run_cmd mongosh --quiet -u "admin" -p "${MONGO_ADMIN_PW}" \
-      --authenticationDatabase admin --eval "
-      db = db.getSiblingDB('admin');
+    local esc_opa_pw; esc_opa_pw="$(escape_js "$OPA_SVC_PW")"
+    mongosh_admin_eval "
       if (db.getUser('opa_svc') == null) {
         db.createUser({
           user: 'opa_svc',
@@ -1213,7 +1382,7 @@ create_mongo_opa_user() {
         db.updateUser('opa_svc', { pwd: '${esc_opa_pw}' });
         print('MongoDB opa_svc user updated.');
       }
-    " 2>&1 | tee -a "$LOG_FILE" || {
+    " || {
       log_error "Failed to create MongoDB opa_svc user."
       return 1
     }
@@ -1512,7 +1681,7 @@ PGSEC
     if [[ "$INSTALL_MONGO" == "true" ]]; then
       cat <<MONGOSEC
 
-[MONGODB 7.x]
+[MONGODB ${MONGO_INSTALLED_VERSION}.x]
 Service          : mongod
 Port             : 27017
 Data directory   : /var/lib/mongodb
@@ -1555,6 +1724,9 @@ SEEDHEADER
         echo ""
         echo "MySQL seeded databases:"
         for entry in "${MYSQL_SEEDED_DBS[@]}"; do
+          if ! [[ "$entry" =~ ^[^:]+:[^:]+:.+$ ]]; then
+            log_warn "Skipping malformed seeded DB entry: ${entry}"; continue
+          fi
           IFS=':' read -r dbn dbu dbp <<< "$entry"
           printf "  %-14s  user: %-14s  pw: %s\n" "$dbn" "$dbu" "$dbp"
           printf "  Test: mysql -u %s -p'%s' %s -e \"SELECT COUNT(*) FROM lab_records;\"\n" \
@@ -1566,6 +1738,9 @@ SEEDHEADER
         echo ""
         echo "PostgreSQL seeded databases:"
         for entry in "${PG_SEEDED_DBS[@]}"; do
+          if ! [[ "$entry" =~ ^[^:]+:[^:]+:.+$ ]]; then
+            log_warn "Skipping malformed seeded DB entry: ${entry}"; continue
+          fi
           IFS=':' read -r dbn dbu dbp <<< "$entry"
           printf "  %-14s  user: %-14s  pw: %s\n" "$dbn" "$dbu" "$dbp"
           printf "  Test: PGPASSWORD='%s' psql -U %s -d %s -c \"SELECT COUNT(*) FROM lab_records;\"\n" \
@@ -1577,6 +1752,9 @@ SEEDHEADER
         echo ""
         echo "MongoDB seeded databases:"
         for entry in "${MONGO_SEEDED_DBS[@]}"; do
+          if ! [[ "$entry" =~ ^[^:]+:[^:]+:.+$ ]]; then
+            log_warn "Skipping malformed seeded DB entry: ${entry}"; continue
+          fi
           IFS=':' read -r dbn dbu dbp <<< "$entry"
           printf "  %-14s  user: %-14s  pw: %s\n" "$dbn" "$dbu" "$dbp"
           printf "  Test: mongosh -u %s -p '%s' --authenticationDatabase %s %s --eval \"db.lab_records.countDocuments()\"\n" \
@@ -1699,7 +1877,7 @@ CREATE USER IF NOT EXISTS '${esc_user}'@'%' IDENTIFIED BY '${esc_pw}';
 GRANT ALL PRIVILEGES ON *.* TO '${esc_user}'@'%' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
-  mysql -u root -p"${MYSQL_ROOT_PW}" < "$sql_file" 2>&1 | tee -a "$LOG_FILE" || {
+  MYSQL_PWD="${MYSQL_ROOT_PW}" mysql -u root < "$sql_file" 2>&1 | tee -a "$LOG_FILE" || {
     log_error "Failed to create MySQL lab admin user."
     rm -f "$sql_file"; return 1
   }
@@ -1754,7 +1932,7 @@ SELECT CONCAT('user_',n), CONCAT('user_',n,'@lab.example.com'), ROUND(RAND()*100
 FROM gen;
 FLUSH PRIVILEGES;
 SQL
-    mysql -u root -p"${MYSQL_ROOT_PW}" < "$sql_file" 2>&1 | tee -a "$LOG_FILE" || {
+    MYSQL_PWD="${MYSQL_ROOT_PW}" mysql -u root < "$sql_file" 2>&1 | tee -a "$LOG_FILE" || {
       log_error "Failed to seed MySQL database '${db_name}'."
       rm -f "$sql_file"; return 1
     }
@@ -1892,12 +2070,9 @@ create_mongo_lab_admin() {
     log_dry "Would create MongoDB root user '${LAB_ADMIN_USER}'"
     return 0
   fi
-  local esc_admin_pw; esc_admin_pw="$(escape_js "$MONGO_ADMIN_PW")"
   local esc_lab_user; esc_lab_user="$(escape_js "$LAB_ADMIN_USER")"
   local esc_lab_pw;   esc_lab_pw="$(escape_js "$LAB_ADMIN_PW")"
-  mongosh --quiet -u "admin" -p "${MONGO_ADMIN_PW}" \
-    --authenticationDatabase admin --eval "
-    db = db.getSiblingDB('admin');
+  mongosh_admin_eval "
     if (db.getUser('${esc_lab_user}') == null) {
       db.createUser({ user: '${esc_lab_user}', pwd: '${esc_lab_pw}',
                       roles: [{role:'root', db:'admin'}] });
@@ -1906,7 +2081,7 @@ create_mongo_lab_admin() {
       db.updateUser('${esc_lab_user}', { pwd: '${esc_lab_pw}' });
       print('MongoDB lab admin updated.');
     }
-  " 2>&1 | tee -a "$LOG_FILE" || {
+  " || {
     log_error "Failed to create MongoDB lab admin user."
     return 1
   }
@@ -1915,8 +2090,7 @@ create_mongo_lab_admin() {
 
 seed_mongodb_data() {
   log_step "MongoDB — seeding ${SEED_DBS} database(s), ${SEED_ROWS} document(s) each"
-  local esc_admin_pw esc_lab_user
-  esc_admin_pw="$(escape_js "$MONGO_ADMIN_PW")"
+  local esc_lab_user
   esc_lab_user="$(escape_js "$LAB_ADMIN_USER")"
 
   # Generate all names up front
@@ -1938,8 +2112,7 @@ seed_mongodb_data() {
     fi
 
     # Create DB user + grant lab_admin readWrite on this DB
-    mongosh --quiet -u "admin" -p "${MONGO_ADMIN_PW}" \
-      --authenticationDatabase admin --eval "
+    mongosh_admin_eval "
       db = db.getSiblingDB('${db_name}');
       if (db.getUser('${esc_db_user}') == null) {
         db.createUser({ user: '${esc_db_user}', pwd: '${esc_db_pw}',
@@ -1950,7 +2123,7 @@ seed_mongodb_data() {
       db = db.getSiblingDB('admin');
       db.grantRolesToUser('${esc_lab_user}', [{role:'readWrite', db:'${db_name}'}]);
       print('DB ${db_name}: user and lab_admin grants applied.');
-    " 2>&1 | tee -a "$LOG_FILE" || {
+    " || {
       log_error "MongoDB user creation failed for '${db_name}'."
       return 1
     }
@@ -1962,8 +2135,7 @@ seed_mongodb_data() {
     for b in $(seq 1 "$batches"); do
       batch_count=$(( SEED_ROWS - inserted ))
       (( batch_count > batch_size )) && batch_count=$batch_size
-      mongosh --quiet -u "admin" -p "${MONGO_ADMIN_PW}" \
-        --authenticationDatabase admin --eval "
+      mongosh_admin_eval "
         db = db.getSiblingDB('${db_name}');
         let offset = ${inserted};
         let docs = [];
@@ -1976,7 +2148,7 @@ seed_mongodb_data() {
         }
         db.lab_records.insertMany(docs);
         print('Batch ${b}/${batches}: ${batch_count} docs inserted into ${db_name}');
-      " 2>&1 | tee -a "$LOG_FILE" || {
+      " || {
         log_error "MongoDB seeding batch ${b} failed for '${db_name}'."
         return 1
       }
@@ -2002,6 +2174,9 @@ main() {
 
   # OS detection must run before rollback so PKG_MANAGER is set when pm_remove is called
   detect_os
+
+  # Detect and clean up any previous run before touching prerequisites or packages
+  cleanup_previous_install
 
   # Handle explicit --rollback request
   if [[ "$DO_ROLLBACK" == "true" ]]; then
