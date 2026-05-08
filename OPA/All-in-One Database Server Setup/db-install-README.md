@@ -410,6 +410,10 @@ sudo bash db-install.sh --rollback
 
 ## Changelog
 
+### v1.3.4
+
+- Fixed: `ECONNREFUSED` race condition across all three database engines — `systemctl is-active` only confirms the systemd unit state, not that the TCP socket is open. A service process can be "active" while still initialising its listener. Added generic `wait_for_tcp_port HOST PORT [TIMEOUT]` helper (uses bash `/dev/tcp`, no extra tools required) and called it at five points: after MySQL start (port 3306), after PostgreSQL start (port 5432), after initial MongoDB start (port 27017), and after both MongoDB restarts in `configure_mongodb()` — the auth-restart was the specific cause of the `MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017` failure seen in production
+
 ### v1.3.3
 
 - Fixed: MySQL Debian/Ubuntu install now uses the official `mysql-apt-config_0.8.39-1_all.deb` package instead of a direct GPG key download — resolves `EXPKEYSIG B7B3B788A8D3785C` error caused by the expired `RPM-GPG-KEY-mysql-2023` key. Package installed is now `mysql-server` (correct metapackage), not `mysql-community-server`

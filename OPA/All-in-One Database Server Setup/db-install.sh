@@ -7,7 +7,7 @@
 #                Creates an OPA service account in each database (MySQL +
 #                PostgreSQL) for use with the OPA Database Gateway JIT feature.
 #
-# Version      : 1.3.3
+# Version      : 1.3.4
 # Supported OS : Ubuntu 20.04 / 22.04 / 24.04
 #                Debian 11 (bullseye) / 12 (bookworm)
 #                RHEL 8 / 9
@@ -68,7 +68,7 @@ set -uo pipefail    # Strict mode: treat unset vars as errors, propagate pipe fa
 # SECTION 1: CONSTANTS & VERSION
 # ==============================================================================
 
-readonly SCRIPT_VERSION="1.3.3"
+readonly SCRIPT_VERSION="1.3.4"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_START_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 readonly SCRIPT_PID="$$"
@@ -738,6 +738,8 @@ install_mysql() {
     log_error "Failed to enable/start MySQL service: ${MYSQL_SERVICE}"
     return 1
   }
+  # Wait for MySQL to open port 3306 before configure_mysql() tries to connect
+  [[ "$DRY_RUN" != "true" ]] && { wait_for_tcp_port 127.0.0.1 3306 || return 1; }
   log_info "MySQL service '${MYSQL_SERVICE}' enabled and started."
 
   # Register rollback: stop + purge MySQL + wipe data directory
@@ -930,6 +932,8 @@ install_postgresql() {
     log_error "Failed to enable/start PostgreSQL service: ${PG_SERVICE}"
     return 1
   }
+  # Wait for PostgreSQL to open port 5432 before create_pg_opa_user() connects
+  [[ "$DRY_RUN" != "true" ]] && { wait_for_tcp_port 127.0.0.1 5432 || return 1; }
   log_info "PostgreSQL service '${PG_SERVICE}' enabled and started."
 
   push_rollback "systemctl stop ${PG_SERVICE} 2>/dev/null || true; \
@@ -1015,6 +1019,27 @@ SQLEOF
 # SECTION 13: MONGODB — INSTALL, CONFIGURE, OPA USER
 # ==============================================================================
 
+# Wait for a TCP port to accept connections (up to max_wait seconds, default 30).
+# systemctl is-active only confirms the unit state — a service process can be
+# "active" while still initialising its network socket (ECONNREFUSED window).
+# Uses bash built-in /dev/tcp — no external tools (nc, curl) required.
+#   Usage: wait_for_tcp_port HOST PORT [MAX_WAIT_SECONDS]
+wait_for_tcp_port() {
+  local host="$1" port="$2" max_wait="${3:-30}"
+  local elapsed=0
+  log_info "Waiting for ${host}:${port} to be ready…"
+  while [[ $elapsed -lt $max_wait ]]; do
+    if (: >/dev/tcp/${host}/${port}) 2>/dev/null; then
+      log_info "${host}:${port} ready (${elapsed}s elapsed)."
+      return 0
+    fi
+    sleep 1
+    (( elapsed++ ))
+  done
+  log_error "${host}:${port} not reachable after ${max_wait} seconds."
+  return 1
+}
+
 install_mongodb() {
   # MongoDB 8.0 is the current latest stable release (October 2024+).
   # Amazon Linux 2 (CentOS 7-based) does not have MongoDB 8.0 packages;
@@ -1093,6 +1118,8 @@ REPOEOF
       log_error "MongoDB service failed to become active after 15 seconds."
       return 1
     fi
+    # Service is active but socket may still be initialising — wait for the port
+    wait_for_tcp_port 127.0.0.1 27017 || return 1
   fi
   log_info "MongoDB service '${MONGO_SERVICE}' enabled and started."
 
@@ -1142,9 +1169,11 @@ configure_mongodb() {
     fi
 
     run_cmd systemctl restart "$MONGO_SERVICE"
-    # Wait for mongod to become active after restart (up to 15 seconds)
+    # Wait for the unit to be active, then wait for the port — auth restart
+    # takes longer than the initial start; ECONNREFUSED in create_mongo_opa_user
+    # is caused by connecting before the socket is ready.
     local attempts=0
-    while ! systemctl is-active --quiet "$MONGO_SERVICE" && [[ $attempts -lt 15 ]]; do
+    while ! systemctl is-active --quiet "$MONGO_SERVICE" && [[ $attempts -lt 20 ]]; do
       sleep 1
       (( attempts++ ))
     done
@@ -1152,6 +1181,7 @@ configure_mongodb() {
       log_error "MongoDB failed to restart with authentication enabled."
       return 1
     fi
+    wait_for_tcp_port 127.0.0.1 27017 || return 1
     log_info "MongoDB restarted with authentication enabled."
   fi
 }
