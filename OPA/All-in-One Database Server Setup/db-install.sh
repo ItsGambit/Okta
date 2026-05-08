@@ -7,7 +7,7 @@
 #                Creates an OPA service account in each database (MySQL +
 #                PostgreSQL) for use with the OPA Database Gateway JIT feature.
 #
-# Version      : 1.3.2
+# Version      : 1.3.3
 # Supported OS : Ubuntu 20.04 / 22.04 / 24.04
 #                Debian 11 (bullseye) / 12 (bookworm)
 #                RHEL 8 / 9
@@ -68,7 +68,7 @@ set -uo pipefail    # Strict mode: treat unset vars as errors, propagate pipe fa
 # SECTION 1: CONSTANTS & VERSION
 # ==============================================================================
 
-readonly SCRIPT_VERSION="1.3.2"
+readonly SCRIPT_VERSION="1.3.3"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_START_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 readonly SCRIPT_PID="$$"
@@ -78,7 +78,7 @@ readonly CRED_FILE_DEFAULT="/root/db-credentials.txt"
 readonly TEMP_DIR="/tmp/db-install-${SCRIPT_PID}"
 
 # Supported PostgreSQL major version installed from PGDG
-readonly PG_VERSION="16"
+readonly PG_VERSION="17"
 
 # ==============================================================================
 # SECTION 2: RUNTIME DEFAULTS  (overridden by CLI flags)
@@ -563,6 +563,58 @@ check_prerequisites() {
   log_info "All prerequisite checks passed."
 }
 
+# Run a full OS package upgrade so database installs land on a fully patched system.
+update_system() {
+  log_step "Updating system packages before installation"
+  pm_update
+  pm_upgrade
+  log_info "System packages are up to date."
+}
+
+# Detect whether the OS has a pending reboot (e.g. kernel update not yet active).
+# Warns in non-interactive mode; prompts to abort in interactive mode.
+check_reboot_required() {
+  log_step "Checking for pending system reboot"
+  local reboot_needed=false
+
+  case "$DISTRO_FAMILY" in
+    debian)
+      [[ -f /var/run/reboot-required ]] && reboot_needed=true
+      ;;
+    rhel)
+      # needs-restarting is in yum-utils / dnf-utils; skip check gracefully if absent
+      if command_exists needs-restarting; then
+        needs-restarting -r &>/dev/null || reboot_needed=true
+      elif [[ -f /run/reboot-required ]]; then
+        reboot_needed=true
+      fi
+      ;;
+    suse)
+      # zypper ps -s lists services using deleted files (sign that reboot is needed)
+      if zypper ps -s 2>/dev/null | grep -q 'Running processes'; then
+        reboot_needed=true
+      elif [[ -f /run/reboot-required ]]; then
+        reboot_needed=true
+      fi
+      ;;
+  esac
+
+  if [[ "$reboot_needed" == "true" ]]; then
+    log_warn "A system reboot is pending (e.g. kernel update applied but not yet active)."
+    log_warn "It is strongly recommended to reboot before installing database services."
+    if [[ "$INTERACTIVE" == "true" ]]; then
+      if ! confirm "Continue installation without rebooting?"; then
+        log_info "Please reboot the server and re-run this script."
+        exit 0
+      fi
+    else
+      log_warn "Non-interactive mode: continuing despite pending reboot. Reboot after installation completes."
+    fi
+  else
+    log_info "Reboot check      : no pending reboot detected"
+  fi
+}
+
 # ==============================================================================
 # SECTION 10: PACKAGE MANAGER ABSTRACTION
 # ==============================================================================
@@ -589,6 +641,17 @@ pm_install() {
   esac
 }
 
+# Upgrade all installed packages to latest available versions
+pm_upgrade() {
+  log_info "Upgrading all installed packages…"
+  case "$PKG_MANAGER" in
+    apt)    run_cmd env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y ;;
+    dnf)    run_cmd dnf upgrade -y ;;
+    yum)    run_cmd yum update -y ;;
+    zypper) run_cmd zypper update -y ;;
+  esac
+}
+
 # Remove/purge one or more packages (used by rollback)
 pm_remove() {
   log_warn "Removing packages: $*"
@@ -610,17 +673,26 @@ install_mysql() {
 
   case "$DISTRO_FAMILY" in
     debian)
-      # Add MySQL APT repo manually (GPG key + sources.list) to avoid the
-      # mysql-apt-config .deb package, which launches an interactive Debconf dialog
-      # that hangs even in DEBIAN_FRONTEND=noninteractive pipelines.
-      local mysql_keyring="/usr/share/keyrings/mysql-server.gpg"
-      log_info "Adding MySQL Community APT repository (direct GPG + sources.list method)…"
-      run_cmd curl -fsSL https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 \
-        | gpg --dearmor | run_cmd tee "$mysql_keyring" > /dev/null
-      echo "deb [signed-by=${mysql_keyring}] https://repo.mysql.com/apt/${OS_ID} ${OS_CODENAME} mysql-8.4-lts" \
-        | run_cmd tee /etc/apt/sources.list.d/mysql.list > /dev/null
+      # Use the official mysql-apt-config .deb package — it carries the current,
+      # non-expired GPG key and sets up /etc/apt/sources.list.d/mysql.list.
+      # The manual RPM-GPG-KEY-mysql-2023 URL is expired (EXPKEYSIG B7B3B788A8D3785C).
+      # With DEBIAN_FRONTEND=noninteractive and debconf-set-selections, dpkg -i runs
+      # silently and selects mysql-8.4-lts as the target version.
+      local apt_config_deb="${TEMP_DIR}/mysql-apt-config.deb"
+      log_info "Downloading MySQL APT repository config package…"
+      run_cmd curl -fsSL \
+        "https://dev.mysql.com/get/mysql-apt-config_0.8.39-1_all.deb" \
+        -o "$apt_config_deb"
+      # Pre-select mysql-8.4-lts so dpkg -i picks the LTS stream silently
+      if command_exists debconf-set-selections; then
+        echo "mysql-apt-config mysql-apt-config/select-server select mysql-8.4-lts" \
+          | debconf-set-selections 2>/dev/null || true
+        echo "mysql-apt-config mysql-apt-config/select-preview select Disabled" \
+          | debconf-set-selections 2>/dev/null || true
+      fi
+      run_cmd env DEBIAN_FRONTEND=noninteractive dpkg -i "$apt_config_deb"
       pm_update
-      run_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-community-server
+      run_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
       MYSQL_SERVICE="mysql"
       ;;
 
@@ -944,8 +1016,12 @@ SQLEOF
 # ==============================================================================
 
 install_mongodb() {
-  log_step "Installing MongoDB 7.x (from official MongoDB repo)"
-  local mongo_version="7.0"
+  # MongoDB 8.0 is the current latest stable release (October 2024+).
+  # Amazon Linux 2 (CentOS 7-based) does not have MongoDB 8.0 packages;
+  # AL2 falls back to 7.0 (last version with AL2 support). AL2023 uses 8.0.
+  local mongo_version="8.0"
+  [[ "$OS_ID" == "amzn" && "$OS_VERSION" == "2" ]] && mongo_version="7.0"
+  log_step "Installing MongoDB ${mongo_version} (from official MongoDB repo)"
 
   case "$DISTRO_FAMILY" in
     debian)
@@ -967,14 +1043,22 @@ https://repo.mongodb.org/apt/${OS_ID} ${OS_CODENAME}/mongodb-org/${mongo_version
       if [[ "$DRY_RUN" == "true" ]]; then
         log_dry "Would create /etc/yum.repos.d/mongodb-org-${mongo_version}.repo"
       else
-        # Amazon Linux uses dedicated repo paths (/yum/amazon/) — not /yum/redhat/.
-        # Using the redhat path on Amazon Linux returns HTTP 404 for releasever 2 / 2023.
-        local mongo_repo_os
-        [[ "$OS_ID" == "amzn" ]] && mongo_repo_os="amazon" || mongo_repo_os="redhat"
+        # AL2 uses the dedicated amazon/2 repo path (MongoDB 7.0 only).
+        # AL2023 uses the RHEL 9 repo path (MongoDB 8.0 fully supported).
+        # All other RHEL-family distros use /yum/redhat/$releasever.
+        local mongo_repo_base
+        if [[ "$OS_ID" == "amzn" && "$OS_VERSION" == "2" ]]; then
+          mongo_repo_base="https://repo.mongodb.org/yum/amazon/2/mongodb-org/${mongo_version}/x86_64/"
+        elif [[ "$OS_ID" == "amzn" ]]; then
+          # AL2023 — use RHEL 9 repo (AL2023 is RHEL 9-compatible)
+          mongo_repo_base="https://repo.mongodb.org/yum/redhat/9/mongodb-org/${mongo_version}/x86_64/"
+        else
+          mongo_repo_base="https://repo.mongodb.org/yum/redhat/\$releasever/mongodb-org/${mongo_version}/x86_64/"
+        fi
         cat > /etc/yum.repos.d/mongodb-org-${mongo_version}.repo <<REPOEOF
 [mongodb-org-${mongo_version}]
 name=MongoDB Repository
-baseurl=https://repo.mongodb.org/yum/${mongo_repo_os}/\$releasever/mongodb-org/${mongo_version}/x86_64/
+baseurl=${mongo_repo_base}
 gpgcheck=1
 enabled=1
 gpgkey=https://www.mongodb.org/static/pgp/server-${mongo_version}.asc
@@ -1909,6 +1993,10 @@ main() {
 
   # --- Prerequisites (skipped in rollback mode) ---
   check_prerequisites
+
+  # --- Ensure OS is fully patched before installing DB services ---
+  update_system
+  check_reboot_required
 
   # --- Interactive confirmation & firewall decision ---
   confirm_selections

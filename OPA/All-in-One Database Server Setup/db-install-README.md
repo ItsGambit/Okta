@@ -1,6 +1,6 @@
 # db-install.sh
 
-A production-ready bash script that installs and configures **MySQL 8.x**, **PostgreSQL 16.x**, and **MongoDB 7.x** on any Linux distribution supported by [Okta Privileged Access (OPA)](https://help.okta.com/en-us/content/topics/privileged-access/pam-overview.htm).
+A production-ready bash script that installs and configures **MySQL 8.4 LTS**, **PostgreSQL 17.x**, and **MongoDB 8.x** on any Linux distribution supported by [Okta Privileged Access (OPA)](https://help.okta.com/en-us/content/topics/privileged-access/pam-overview.htm).
 
 The script handles vendor repo setup, service configuration, security hardening, OPA service account creation, firewall management, and outputs a chmod-600 credential summary file at the end.
 
@@ -48,6 +48,8 @@ The following must be satisfied before running the script:
 | Internet access    | Required to download packages from vendor repos                     |
 | Tools              | `curl`, `openssl`, `gpg` (Debian family) — installed automatically if missing |
 | Ports              | 3306 (MySQL), 5432 (PostgreSQL), 27017 (MongoDB) must be free       |
+
+> **Note:** The script automatically runs a full OS package upgrade (`apt-get upgrade` / `dnf upgrade` / etc.) before installing databases, and checks for a pending reboot. If a reboot is required (e.g. after a kernel update), the script warns you — in interactive mode it prompts to abort so you can reboot first.
 
 ---
 
@@ -391,6 +393,15 @@ sudo bash db-install.sh --rollback
 ---
 
 ## Changelog
+
+### v1.3.3
+
+- Fixed: MySQL Debian/Ubuntu install now uses the official `mysql-apt-config_0.8.39-1_all.deb` package instead of a direct GPG key download — resolves `EXPKEYSIG B7B3B788A8D3785C` error caused by the expired `RPM-GPG-KEY-mysql-2023` key. Package installed is now `mysql-server` (correct metapackage), not `mysql-community-server`
+- Updated: PostgreSQL upgraded from 16 → **17** (current latest stable from PGDG, released Sept 2024)
+- Updated: MongoDB upgraded from 7.0 → **8.0** (current latest stable, released Oct 2024); Amazon Linux 2 retains 7.0 (last version with AL2 support); Amazon Linux 2023 uses the RHEL 9 repo path for 8.0
+- Added: `update_system()` — script now runs a full OS package upgrade (`apt-get upgrade` / `dnf upgrade` / `yum update` / `zypper update`) before installing databases, ensuring installations start on a fully patched system
+- Added: `check_reboot_required()` — detects pending reboot after OS update (checks `/var/run/reboot-required` on Debian/Ubuntu, `needs-restarting -r` on RHEL, `zypper ps` on SUSE); in interactive mode prompts to abort and reboot first; in non-interactive mode warns and continues
+- Added: `pm_upgrade()` helper in the package manager abstraction layer
 
 ### v1.3.2
 
