@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # join-ubuntu-to-ad.sh
-# Version: 1.1.1
+# Version: 1.1.3
 # Release date: 2026-06-02
 # Join Ubuntu 24.04.x LTS to an Active Directory domain using realmd + SSSD.
 # Supports interactive prompts and non-interactive CLI switches.
@@ -10,7 +10,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.3"
 SCRIPT_VERSION_DATE="2026-06-02"
 LOG_FILE="/var/log/ubuntu-ad-join.log"
 BACKUP_DIR=""
@@ -60,14 +60,13 @@ Non-interactive example:
 Options:
   --domain DOMAIN                 AD DNS domain, e.g. corp.example.com. Required.
   --realm REALM                   Kerberos realm, usually uppercase DOMAIN. Optional.
-  --user USER                     AD account permitted to join computers. Required.
+  --user USER                     AD join user. Accepts username or username@domain.
   --password-file FILE            File containing AD password. If omitted, prompt securely.
   --computer-ou OU                Optional OU DN, e.g. OU=Linux,OU=Servers,DC=corp,DC=example,DC=com.
   --hostname FQDN                 Optional FQDN to set before joining.
   --dns IP[,IP]                   Optional AD DNS server IPs; persisted via systemd-resolved drop-in.
-  --test-user USER                Optional AD user for id/getent validation after join.
+  --test-user USER                Optional AD user for validation. Accepts username or username@domain.
   --membership-software VALUE     auto, adcli, or samba. auto tries adcli then samba fallback.
-                                  Samba fallback is useful with some Windows Server 2025 domains.
   --short-names                   Configure SSSD use_fully_qualified_names = False.
   --no-update                     Skip apt full-upgrade; still installs required packages.
   --allow-reboot-required         Do not treat /var/run/reboot-required as a validation warning.
@@ -83,9 +82,7 @@ Log:
 EOF
 }
 
-show_version() {
-  echo "${SCRIPT_NAME} version ${SCRIPT_VERSION} (${SCRIPT_VERSION_DATE})"
-}
+show_version() { echo "${SCRIPT_NAME} version ${SCRIPT_VERSION} (${SCRIPT_VERSION_DATE})"; }
 
 log() {
   local msg
@@ -101,13 +98,37 @@ warn() { log WARN "$@"; }
 err() { log ERROR "$@"; }
 fatal() { err "$@"; exit 1; }
 
+quote_cmd() {
+  local out="" arg
+  for arg in "$@"; do printf -v out '%s %q' "$out" "$arg"; done
+  echo "${out# }"
+}
+
 run() {
-  info "RUN: $*"
-  if (( VERBOSE )); then "$@" 2>&1 | tee -a "$LOG_FILE"; else "$@" >>"$LOG_FILE" 2>&1; fi
+  local rc cmd
+  cmd="$(quote_cmd "$@")"
+  info "RUN: $cmd"
+  if (( VERBOSE )); then
+    "$@" 2>&1 | tee -a "$LOG_FILE"
+    rc=${PIPESTATUS[0]}
+  else
+    "$@" >>"$LOG_FILE" 2>&1
+    rc=$?
+  fi
+  if (( rc != 0 )); then
+    err "Command failed with exit code ${rc}: ${cmd}"
+    return "$rc"
+  fi
+  return 0
 }
 
 trim() { local var="$*"; var="${var#${var%%[![:space:]]*}}"; echo "${var%${var##*[![:space:]]}}"; }
 upper() { echo "$1" | tr '[:lower:]' '[:upper:]'; }
+contains_at() { [[ "$1" == *"@"* ]]; }
+qualify_ad_user() {
+  local user="$1"
+  if contains_at "$user"; then echo "$user"; else echo "${user}@${DOMAIN}"; fi
+}
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
@@ -135,12 +156,7 @@ parse_args() {
   done
 }
 
-enable_xtrace_if_requested() {
-  if (( VERBOSE )); then
-    XTRACE_WAS_ON=1
-    set -x
-  fi
-}
+enable_xtrace_if_requested() { if (( VERBOSE )); then XTRACE_WAS_ON=1; set -x; fi; }
 
 prompt_if_needed() {
   if [[ -z "$DOMAIN" ]]; then
@@ -154,9 +170,12 @@ prompt_if_needed() {
 
   if [[ -z "$JOIN_USER" ]]; then
     (( NON_INTERACTIVE )) && fatal "--user is required in non-interactive mode."
-    read -r -p "AD join user: " JOIN_USER
+    read -r -p "AD join user [username or username@domain; both accepted]: " JOIN_USER
   fi
+  JOIN_USER="$(trim "$JOIN_USER")"
   [[ -z "$JOIN_USER" ]] && fatal "Join user cannot be empty."
+  info "AD join user accepted as entered for realm join: $JOIN_USER"
+  info "AD join user normalized for lookup as: $(qualify_ad_user "$JOIN_USER")"
 
   if [[ -z "$PASSWORD_FILE" && $NON_INTERACTIVE -eq 0 ]]; then
     set +x
@@ -173,16 +192,10 @@ prompt_if_needed() {
   fi
   [[ -z "${AD_PASSWORD:-}" ]] && fatal "AD password cannot be empty."
 
-  if [[ -z "$DNS_SERVERS" && $NON_INTERACTIVE -eq 0 ]]; then
-    read -r -p "AD DNS server IPs comma-separated [leave blank to keep current DNS]: " DNS_SERVERS
-  fi
-  if [[ -z "$HOST_FQDN" && $NON_INTERACTIVE -eq 0 ]]; then
-    read -r -p "Set host FQDN before join [leave blank to keep current]: " HOST_FQDN
-  fi
-  if [[ -z "$TEST_USER" && $NON_INTERACTIVE -eq 0 ]]; then
-    read -r -p "AD test user for validation [optional, e.g. user@${DOMAIN}]: " TEST_USER
-  fi
-
+  if [[ -z "$DNS_SERVERS" && $NON_INTERACTIVE -eq 0 ]]; then read -r -p "AD DNS server IPs comma-separated [leave blank to keep current DNS]: " DNS_SERVERS; fi
+  if [[ -z "$HOST_FQDN" && $NON_INTERACTIVE -eq 0 ]]; then read -r -p "Set host FQDN before join [leave blank to keep current]: " HOST_FQDN; fi
+  if [[ -z "$TEST_USER" && $NON_INTERACTIVE -eq 0 ]]; then read -r -p "AD test user for validation [optional; username or username@domain; both accepted]: " TEST_USER; fi
+  TEST_USER="$(trim "$TEST_USER")"
   case "$MEMBERSHIP_SOFTWARE" in auto|adcli|samba) ;; *) fatal "--membership-software must be auto, adcli, or samba." ;; esac
 }
 
@@ -196,18 +209,12 @@ require_root_and_ubuntu() {
   info "Detected Ubuntu ${VERSION_ID} (${VERSION_CODENAME:-unknown})."
 }
 
-initialize_log() {
-  touch "$LOG_FILE"
-  chmod 600 "$LOG_FILE"
-  info "Starting ${SCRIPT_NAME} version ${SCRIPT_VERSION} (${SCRIPT_VERSION_DATE})."
-}
+initialize_log() { touch "$LOG_FILE"; chmod 600 "$LOG_FILE"; info "Starting ${SCRIPT_NAME} version ${SCRIPT_VERSION} (${SCRIPT_VERSION_DATE})."; }
 
 create_backup() {
   BACKUP_DIR="/var/backups/ubuntu-ad-join/$(date '+%Y%m%d-%H%M%S')"
   run mkdir -p "$BACKUP_DIR"
-  for p in /etc/sssd/sssd.conf /etc/krb5.conf /etc/nsswitch.conf /etc/pam.d/common-session /etc/systemd/resolved.conf; do
-    [[ -e "$p" ]] && run cp -a "$p" "$BACKUP_DIR/$(basename "$p").bak"
-  done
+  for p in /etc/sssd/sssd.conf /etc/krb5.conf /etc/nsswitch.conf /etc/pam.d/common-session /etc/systemd/resolved.conf; do [[ -e "$p" ]] && run cp -a "$p" "$BACKUP_DIR/$(basename "$p").bak"; done
   [[ -d /etc/systemd/resolved.conf.d ]] && run cp -a /etc/systemd/resolved.conf.d "$BACKUP_DIR/resolved.conf.d.bak" || true
   echo "$BACKUP_DIR" > /var/backups/ubuntu-ad-join/latest
   info "Backup created at $BACKUP_DIR"
@@ -217,20 +224,11 @@ rollback() {
   warn "Starting rollback."
   local latest=""
   [[ -f /var/backups/ubuntu-ad-join/latest ]] && latest="$(cat /var/backups/ubuntu-ad-join/latest)"
-  if command -v realm >/dev/null 2>&1 && [[ -n "${DOMAIN:-}" ]]; then
-    realm leave "$DOMAIN" >>"$LOG_FILE" 2>&1 || warn "realm leave failed or host was not joined."
-  elif command -v realm >/dev/null 2>&1; then
-    realm leave >>"$LOG_FILE" 2>&1 || true
-  fi
+  if command -v realm >/dev/null 2>&1 && [[ -n "${DOMAIN:-}" ]]; then realm leave "$DOMAIN" >>"$LOG_FILE" 2>&1 || warn "realm leave failed or host was not joined."; elif command -v realm >/dev/null 2>&1; then realm leave >>"$LOG_FILE" 2>&1 || true; fi
   if [[ -n "$latest" && -d "$latest" ]]; then
-    for p in sssd.conf krb5.conf nsswitch.conf common-session resolved.conf; do
-      [[ -e "$latest/$p.bak" ]] && cp -a "$latest/$p.bak" "/etc/${p}" || true
-    done
+    for p in sssd.conf krb5.conf nsswitch.conf common-session resolved.conf; do [[ -e "$latest/$p.bak" ]] && cp -a "$latest/$p.bak" "/etc/${p}" || true; done
     rm -f /etc/systemd/resolved.conf.d/90-ad-domain-join.conf || true
-    if [[ -d "$latest/resolved.conf.d.bak" ]]; then
-      mkdir -p /etc/systemd/resolved.conf.d
-      cp -a "$latest/resolved.conf.d.bak/." /etc/systemd/resolved.conf.d/
-    fi
+    if [[ -d "$latest/resolved.conf.d.bak" ]]; then mkdir -p /etc/systemd/resolved.conf.d; cp -a "$latest/resolved.conf.d.bak/." /etc/systemd/resolved.conf.d/; fi
     systemctl restart systemd-resolved sssd oddjobd >>"$LOG_FILE" 2>&1 || true
     info "Restored backup from $latest"
   else
@@ -238,46 +236,23 @@ rollback() {
   fi
 }
 
-on_error() {
-  local line="$1" code="$2"
-  set +x
-  err "Failure at line $line with exit code $code. See $LOG_FILE."
-  if (( ROLLBACK_ON_ERROR )); then rollback; else warn "Auto-rollback disabled."; fi
-  exit "$code"
-}
+on_error() { local line="$1" code="$2"; set +x; err "Failure at line $line with exit code $code. See $LOG_FILE."; if (( ROLLBACK_ON_ERROR )); then rollback; else warn "Auto-rollback disabled."; fi; exit "$code"; }
 trap 'on_error $LINENO $?' ERR
 
 update_and_install() {
   export DEBIAN_FRONTEND=noninteractive
   run apt-get update
-  if (( DO_UPDATE )); then
-    run apt-get -y full-upgrade
-  else
-    warn "Skipping full-upgrade because --no-update was specified."
-  fi
+  if (( DO_UPDATE )); then run apt-get -y full-upgrade; else warn "Skipping full-upgrade because --no-update was specified."; fi
   info "Installing chrony for Kerberos-friendly time sync. This may disable systemd-timesyncd, which is normal on Ubuntu when chrony is installed."
   run apt-get install -y "${REQUIRED_PACKAGES[@]}"
   run systemctl enable --now chrony
   run systemctl enable --now oddjobd
 }
 
-wait_for_resolved() {
-  info "Waiting for systemd-resolved to initialize..."
-  local i
-  for i in {1..10}; do
-    if resolvectl status >>"$LOG_FILE" 2>&1; then
-      sleep 1
-      return 0
-    fi
-    sleep 1
-  done
-  fatal "systemd-resolved did not become ready after restart."
-}
+wait_for_resolved() { info "Waiting for systemd-resolved to initialize..."; local i; for i in {1..10}; do if resolvectl status >>"$LOG_FILE" 2>&1; then sleep 1; return 0; fi; sleep 1; done; fatal "systemd-resolved did not become ready after restart."; }
 
 configure_hostname_dns_time() {
-  if [[ -n "$HOST_FQDN" ]]; then
-    run hostnamectl set-hostname "$HOST_FQDN"
-  fi
+  if [[ -n "$HOST_FQDN" ]]; then run hostnamectl set-hostname "$HOST_FQDN"; fi
   if [[ -n "$DNS_SERVERS" ]]; then
     local dns_space="${DNS_SERVERS//,/ }"
     run mkdir -p /etc/systemd/resolved.conf.d
@@ -289,10 +264,7 @@ EOF
     run systemctl restart systemd-resolved
     wait_for_resolved
   fi
-  if ! grep -qiE "^server[[:space:]]+${DOMAIN//./\.}[[:space:]]" /etc/chrony/chrony.conf; then
-    echo "server ${DOMAIN} iburst prefer" >> /etc/chrony/chrony.conf
-    run systemctl restart chrony
-  fi
+  if ! grep -qiE "^server[[:space:]]+${DOMAIN//./\.}[[:space:]]" /etc/chrony/chrony.conf; then echo "server ${DOMAIN} iburst prefer" >> /etc/chrony/chrony.conf; run systemctl restart chrony; fi
 }
 
 preflight_checks() {
@@ -301,10 +273,7 @@ preflight_checks() {
   run dig +short "$DOMAIN"
   run dig +short SRV "_ldap._tcp.${DOMAIN}"
   run realm -v discover "$DOMAIN"
-  if [[ -n "$DNS_SERVERS" ]]; then
-    local first_dns="${DNS_SERVERS%%,*}"
-    nc -z -w 3 "$first_dns" 53 >>"$LOG_FILE" 2>&1 || warn "Could not verify TCP/53 to first DNS server $first_dns. UDP DNS may still work."
-  fi
+  if [[ -n "$DNS_SERVERS" ]]; then local first_dns="${DNS_SERVERS%%,*}"; nc -z -w 3 "$first_dns" 53 >>"$LOG_FILE" 2>&1 || warn "Could not verify TCP/53 to first DNS server $first_dns. UDP DNS may still work."; fi
   chronyc tracking >>"$LOG_FILE" 2>&1 || warn "chronyc tracking failed; verify time sync if Kerberos errors occur."
 }
 
@@ -314,8 +283,6 @@ join_domain_once() {
   [[ -n "$COMPUTER_OU" ]] && args+=(--computer-ou="$COMPUTER_OU")
   args+=("$DOMAIN")
   info "Attempting domain join using membership software: $method"
-
-  # Do not allow set -x to print AD_PASSWORD. This protects console, logs, and terminal scrollback.
   set +x
   printf '%s\n' "$AD_PASSWORD" | "${args[@]}" >>"$LOG_FILE" 2>&1
   local rc=$?
@@ -324,18 +291,9 @@ join_domain_once() {
 }
 
 join_domain() {
-  if realm list | grep -qiE "^${DOMAIN}[[:space:]]*$"; then
-    info "System already appears joined to $DOMAIN. Skipping join."
-    return 0
-  fi
+  if realm list | grep -qiE "^${DOMAIN}[[:space:]]*$"; then info "System already appears joined to $DOMAIN. Skipping join."; return 0; fi
   if [[ "$MEMBERSHIP_SOFTWARE" == "auto" ]]; then
-    if join_domain_once adcli; then
-      info "Domain join succeeded using adcli."
-    else
-      warn "adcli join failed; trying samba fallback. This can help with Windows Server 2025 domain controllers."
-      join_domain_once samba
-      info "Domain join succeeded using samba."
-    fi
+    if join_domain_once adcli; then info "Domain join succeeded using adcli."; else warn "adcli join failed; trying samba fallback. This can help with Windows Server 2025 domain controllers."; join_domain_once samba; info "Domain join succeeded using samba."; fi
   else
     join_domain_once "$MEMBERSHIP_SOFTWARE"
     info "Domain join succeeded using $MEMBERSHIP_SOFTWARE."
@@ -347,29 +305,37 @@ post_configure() {
   if [[ -f /etc/sssd/sssd.conf ]]; then
     run chmod 600 /etc/sssd/sssd.conf
     if (( SHORT_NAMES )); then
-      if grep -q '^use_fully_qualified_names' /etc/sssd/sssd.conf; then
-        sed -i 's/^use_fully_qualified_names.*/use_fully_qualified_names = False/' /etc/sssd/sssd.conf
-      else
-        sed -i '/^\[domain\//a use_fully_qualified_names = False' /etc/sssd/sssd.conf
-      fi
+      if grep -q '^use_fully_qualified_names' /etc/sssd/sssd.conf; then sed -i 's/^use_fully_qualified_names.*/use_fully_qualified_names = False/' /etc/sssd/sssd.conf; else sed -i '/^\[domain\//a use_fully_qualified_names = False' /etc/sssd/sssd.conf; fi
     fi
   fi
   run systemctl enable --now sssd
   run systemctl restart sssd
 }
 
+validate_optional_test_user() {
+  local user="$1" candidate=""
+  [[ -z "$user" ]] && return 0
+  candidate="$(qualify_ad_user "$user")"
+  info "Validating optional AD test user: $candidate"
+  if id "$candidate" >>"$LOG_FILE" 2>&1; then
+    info "AD test user resolved successfully: $candidate"
+    getent passwd "$candidate" >>"$LOG_FILE" 2>&1 || warn "getent passwd failed for $candidate, but id succeeded."
+    return 0
+  fi
+  if [[ "$candidate" != "$user" ]]; then warn "AD test user '$user' did not resolve as a short name; tried fully qualified form '$candidate'."; fi
+  warn "Optional AD test user validation failed for '$candidate'. Domain join itself is still successful. Try: id '$candidate'."
+  return 0
+}
+
 validate_join() {
   info "Running post-join validation."
   run realm list
   realm list | grep -qi "configured: kerberos-member" || fatal "realm list does not show configured: kerberos-member."
-  getent passwd "${JOIN_USER}@${DOMAIN}" >>"$LOG_FILE" 2>&1 || warn "Could not resolve ${JOIN_USER}@${DOMAIN}; this may be expected if join account is not a normal user or short-names are enabled."
-  if [[ -n "$TEST_USER" ]]; then
-    run id "$TEST_USER"
-    getent passwd "$TEST_USER" >>"$LOG_FILE" 2>&1 || warn "getent passwd failed for $TEST_USER, but id may have succeeded."
-  fi
-  if [[ -f /var/run/reboot-required && $ALLOW_REBOOT_REQUIRED -eq 0 ]]; then
-    warn "A reboot is required due to package updates: /var/run/reboot-required exists."
-  fi
+  local join_user_lookup
+  join_user_lookup="$(qualify_ad_user "$JOIN_USER")"
+  getent passwd "$join_user_lookup" >>"$LOG_FILE" 2>&1 || warn "Could not resolve $join_user_lookup; this may be expected if join account is not a normal user or short-names are enabled."
+  validate_optional_test_user "$TEST_USER"
+  if [[ -f /var/run/reboot-required && $ALLOW_REBOOT_REQUIRED -eq 0 ]]; then warn "A reboot is required due to package updates: /var/run/reboot-required exists."; fi
   info "Validation complete. Domain join finished successfully."
 }
 
@@ -389,5 +355,4 @@ main() {
   validate_join
   info "Success. ${SCRIPT_NAME} version ${SCRIPT_VERSION}. Log file: $LOG_FILE"
 }
-
 main "$@"
