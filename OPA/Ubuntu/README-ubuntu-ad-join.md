@@ -1,14 +1,70 @@
 # Ubuntu 24.04.x LTS to Windows Server 2025 Active Directory Domain Join
 
+**Version:** 1.1.1  
+**Release date:** 2026-06-02
+
 This package contains `join-ubuntu-to-ad.sh`, a Bash script that joins an Ubuntu 24.04.x LTS server to a Windows Active Directory domain using `realmd` and SSSD.
+
+## Download from GitHub
+
+If the server has internet access, download the raw script directly from GitHub. This keeps the filename as `join-ubuntu-to-ad.sh`:
+
+```bash
+cd /tmp
+curl -fsSLo join-ubuntu-to-ad.sh https://raw.githubusercontent.com/ItsGambit/Okta/main/OPA/Ubuntu/join-ubuntu-to-ad.sh
+chmod +x join-ubuntu-to-ad.sh
+./join-ubuntu-to-ad.sh --version
+sudo ./join-ubuntu-to-ad.sh --help
+```
+
+Alternative with `wget`, also keeping the same filename:
+
+```bash
+cd /tmp
+wget -O join-ubuntu-to-ad.sh https://raw.githubusercontent.com/ItsGambit/Okta/main/OPA/Ubuntu/join-ubuntu-to-ad.sh
+chmod +x join-ubuntu-to-ad.sh
+./join-ubuntu-to-ad.sh --version
+sudo ./join-ubuntu-to-ad.sh --help
+```
+
+> Do not use the normal GitHub `blob` URL with `curl` for execution. Use the `raw.githubusercontent.com` URL above.
+
+## Versioning
+
+Current release: **1.1.1**  
+Release date: **2026-06-02**
+
+Check the downloaded script version without root privileges:
+
+```bash
+./join-ubuntu-to-ad.sh --version
+```
+
+The script also writes its version at startup and on the success log line in `/var/log/ubuntu-ad-join.log`.
+
+## Changelog
+
+### 1.1.1 - 2026-06-02
+
+- Applied the formatting patch directly to the script.
+- Normalized the AD password pipe to use `printf '%s\n' "$AD_PASSWORD"` instead of a literal newline inside the format string.
+- Kept the file names unchanged: `join-ubuntu-to-ad.sh` and `README-ubuntu-ad-join.md`.
+
+### 1.1.0 - 2026-06-02
+
+- Added script and README versioning.
+- Added `--version` / `-V` support.
+- Retained password tracing protection, safer rollback, and DNS restart wait logic.
 
 ## What it does
 
-- Verifies the host is Ubuntu 24.04.x and running as root.
+- Verifies the host is Ubuntu 24.04.x and running as root, except `--help` and `--version`, which work as a non-root user.
 - Prompts for required values, or accepts switches for non-interactive automation.
 - Updates the package index, optionally performs `apt full-upgrade`, and installs required AD/SSSD packages.
+- Installs `chrony` for Kerberos-friendly time synchronization. On Ubuntu this can disable `systemd-timesyncd`, which is expected behavior.
 - Optionally sets the host FQDN.
 - Optionally persists AD DNS servers through a `systemd-resolved` drop-in.
+- Waits for `systemd-resolved` to initialize after DNS changes before preflight checks.
 - Checks DNS SRV discovery, `realm discover`, and time sync status before joining.
 - Joins the domain with `realm join`.
 - Uses `--membership-software auto` by default: tries `adcli`, then falls back to Samba if needed.
@@ -16,6 +72,7 @@ This package contains `join-ubuntu-to-ad.sh`, a Bash script that joins an Ubuntu
 - Performs post-join validation with `realm list`, `getent`, and optional `id <test-user>`.
 - Logs verbosely to `/var/log/ubuntu-ad-join.log`.
 - Creates backups under `/var/backups/ubuntu-ad-join/` and can rollback on error.
+- Protects AD passwords from `set -x` tracing when `--verbose` is used.
 
 ## Why the Samba fallback exists
 
@@ -54,17 +111,7 @@ sudo nano /root/ad_join_password.txt
 Run:
 
 ```bash
-sudo ./join-ubuntu-to-ad.sh \
-  --non-interactive \
-  --domain corp.example.com \
-  --user join_account \
-  --password-file /root/ad_join_password.txt \
-  --dns 10.0.0.10,10.0.0.11 \
-  --hostname ubuntu01.corp.example.com \
-  --computer-ou 'OU=Linux,OU=Servers,DC=corp,DC=example,DC=com' \
-  --membership-software auto \
-  --test-user 'someuser@corp.example.com' \
-  --verbose
+sudo ./join-ubuntu-to-ad.sh   --non-interactive   --domain corp.example.com   --user join_account   --password-file /root/ad_join_password.txt   --dns 10.0.0.10,10.0.0.11   --hostname ubuntu01.corp.example.com   --computer-ou 'OU=Linux,OU=Servers,DC=corp,DC=example,DC=com'   --membership-software auto   --test-user 'someuser@corp.example.com'   --verbose
 ```
 
 ## Important switches
@@ -83,7 +130,8 @@ sudo ./join-ubuntu-to-ad.sh \
 --no-update                     Skip `apt full-upgrade`.
 --rollback                      Leave the domain and restore latest backup.
 --non-interactive               Do not prompt.
---verbose                       Log and echo command output.
+--verbose                       Echo non-sensitive command output and log more detail.
+--version                       Show script version. Does not require root.
 ```
 
 ## Rollback
@@ -98,7 +146,9 @@ Rollback attempts to:
 
 1. Run `realm leave`.
 2. Restore backed up configuration files from `/var/backups/ubuntu-ad-join/latest`.
-3. Restart affected services.
+3. Remove only the DNS drop-in file created by the script: `/etc/systemd/resolved.conf.d/90-ad-domain-join.conf`.
+4. Overlay the backed-up `resolved.conf.d` contents instead of deleting the entire directory.
+5. Restart affected services.
 
 ## Validation performed
 
@@ -137,4 +187,5 @@ realm list
 
 - Prefer a delegated AD join account instead of Domain Administrator.
 - If using `--password-file`, store it with mode `600`, owned by root, and delete it after joining if no longer needed.
+- The script disables shell tracing around password reads and password piping, even when `--verbose` is enabled.
 - The script log is created mode `600`; do not paste logs publicly without redacting domain/user details.

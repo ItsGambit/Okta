@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # join-ubuntu-to-ad.sh
+# Version: 1.1.1
+# Release date: 2026-06-02
 # Join Ubuntu 24.04.x LTS to an Active Directory domain using realmd + SSSD.
 # Supports interactive prompts and non-interactive CLI switches.
-# Tested syntax with bash -n. Run as root.
+# Run as root for all actions except --help and --version.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="$(basename "$0")"
+SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION_DATE="2026-06-02"
 LOG_FILE="/var/log/ubuntu-ad-join.log"
 BACKUP_DIR=""
 ROLLBACK_ON_ERROR=1
@@ -15,6 +19,7 @@ NON_INTERACTIVE=0
 DO_UPDATE=1
 DO_ROLLBACK_ONLY=0
 VERBOSE=0
+XTRACE_WAS_ON=0
 DOMAIN=""
 REALM=""
 JOIN_USER=""
@@ -23,7 +28,7 @@ COMPUTER_OU=""
 HOST_FQDN=""
 DNS_SERVERS=""
 TEST_USER=""
-MEMBERSHIP_SOFTWARE="auto"   # auto|adcli|samba
+MEMBERSHIP_SOFTWARE="auto"
 SHORT_NAMES=0
 ALLOW_REBOOT_REQUIRED=0
 
@@ -69,15 +74,28 @@ Options:
   --no-auto-rollback              Do not automatically rollback on error.
   --rollback                      Leave the joined domain and restore latest backup, then exit.
   --non-interactive               Do not prompt; fail if required values are missing.
-  -v, --verbose                   Echo commands and log more detail.
-  -h, --help                      Show help.
+  -v, --verbose                   Echo non-sensitive commands and log more detail.
+  -V, --version                   Show script version. Does not require root.
+  -h, --help                      Show help. Does not require root.
 
 Log:
   /var/log/ubuntu-ad-join.log
 EOF
 }
 
-log() { echo "$(date '+%F %T%z') [$1] ${*:2}" | tee -a "$LOG_FILE" >&2; }
+show_version() {
+  echo "${SCRIPT_NAME} version ${SCRIPT_VERSION} (${SCRIPT_VERSION_DATE})"
+}
+
+log() {
+  local msg
+  msg="$(date '+%F %T%z') [$1] ${*:2}"
+  if [[ -w "$LOG_FILE" || ( ! -e "$LOG_FILE" && -w "$(dirname "$LOG_FILE")" ) ]]; then
+    echo "$msg" | tee -a "$LOG_FILE" >&2
+  else
+    echo "$msg" >&2
+  fi
+}
 info() { log INFO "$@"; }
 warn() { log WARN "$@"; }
 err() { log ERROR "$@"; }
@@ -109,11 +127,19 @@ parse_args() {
       --no-auto-rollback) ROLLBACK_ON_ERROR=0; shift ;;
       --rollback) DO_ROLLBACK_ONLY=1; shift ;;
       --non-interactive) NON_INTERACTIVE=1; shift ;;
-      -v|--verbose) VERBOSE=1; set -x; shift ;;
+      -v|--verbose) VERBOSE=1; shift ;;
+      -V|--version) show_version; exit 0 ;;
       -h|--help) usage; exit 0 ;;
       *) fatal "Unknown option: $1. Use --help." ;;
     esac
   done
+}
+
+enable_xtrace_if_requested() {
+  if (( VERBOSE )); then
+    XTRACE_WAS_ON=1
+    set -x
+  fi
 }
 
 prompt_if_needed() {
@@ -133,11 +159,15 @@ prompt_if_needed() {
   [[ -z "$JOIN_USER" ]] && fatal "Join user cannot be empty."
 
   if [[ -z "$PASSWORD_FILE" && $NON_INTERACTIVE -eq 0 ]]; then
+    set +x
     read -r -s -p "AD password for ${JOIN_USER}: " AD_PASSWORD; echo >&2
+    if (( XTRACE_WAS_ON )); then set -x; fi
   elif [[ -n "$PASSWORD_FILE" ]]; then
     [[ -r "$PASSWORD_FILE" ]] || fatal "Password file is not readable: $PASSWORD_FILE"
+    set +x
     AD_PASSWORD="$(<"$PASSWORD_FILE")"
     AD_PASSWORD="${AD_PASSWORD%$'\n'}"
+    if (( XTRACE_WAS_ON )); then set -x; fi
   else
     fatal "--password-file is required in non-interactive mode."
   fi
@@ -166,6 +196,12 @@ require_root_and_ubuntu() {
   info "Detected Ubuntu ${VERSION_ID} (${VERSION_CODENAME:-unknown})."
 }
 
+initialize_log() {
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+  info "Starting ${SCRIPT_NAME} version ${SCRIPT_VERSION} (${SCRIPT_VERSION_DATE})."
+}
+
 create_backup() {
   BACKUP_DIR="/var/backups/ubuntu-ad-join/$(date '+%Y%m%d-%H%M%S')"
   run mkdir -p "$BACKUP_DIR"
@@ -190,9 +226,10 @@ rollback() {
     for p in sssd.conf krb5.conf nsswitch.conf common-session resolved.conf; do
       [[ -e "$latest/$p.bak" ]] && cp -a "$latest/$p.bak" "/etc/${p}" || true
     done
+    rm -f /etc/systemd/resolved.conf.d/90-ad-domain-join.conf || true
     if [[ -d "$latest/resolved.conf.d.bak" ]]; then
-      rm -rf /etc/systemd/resolved.conf.d
-      cp -a "$latest/resolved.conf.d.bak" /etc/systemd/resolved.conf.d
+      mkdir -p /etc/systemd/resolved.conf.d
+      cp -a "$latest/resolved.conf.d.bak/." /etc/systemd/resolved.conf.d/
     fi
     systemctl restart systemd-resolved sssd oddjobd >>"$LOG_FILE" 2>&1 || true
     info "Restored backup from $latest"
@@ -203,6 +240,7 @@ rollback() {
 
 on_error() {
   local line="$1" code="$2"
+  set +x
   err "Failure at line $line with exit code $code. See $LOG_FILE."
   if (( ROLLBACK_ON_ERROR )); then rollback; else warn "Auto-rollback disabled."; fi
   exit "$code"
@@ -217,16 +255,29 @@ update_and_install() {
   else
     warn "Skipping full-upgrade because --no-update was specified."
   fi
+  info "Installing chrony for Kerberos-friendly time sync. This may disable systemd-timesyncd, which is normal on Ubuntu when chrony is installed."
   run apt-get install -y "${REQUIRED_PACKAGES[@]}"
   run systemctl enable --now chrony
   run systemctl enable --now oddjobd
+}
+
+wait_for_resolved() {
+  info "Waiting for systemd-resolved to initialize..."
+  local i
+  for i in {1..10}; do
+    if resolvectl status >>"$LOG_FILE" 2>&1; then
+      sleep 1
+      return 0
+    fi
+    sleep 1
+  done
+  fatal "systemd-resolved did not become ready after restart."
 }
 
 configure_hostname_dns_time() {
   if [[ -n "$HOST_FQDN" ]]; then
     run hostnamectl set-hostname "$HOST_FQDN"
   fi
-
   if [[ -n "$DNS_SERVERS" ]]; then
     local dns_space="${DNS_SERVERS//,/ }"
     run mkdir -p /etc/systemd/resolved.conf.d
@@ -236,9 +287,8 @@ DNS=${dns_space}
 Domains=${DOMAIN}
 EOF
     run systemctl restart systemd-resolved
+    wait_for_resolved
   fi
-
-  # Add AD domain as preferred time source if chrony is installed. Harmless if domain not NTP-capable.
   if ! grep -qiE "^server[[:space:]]+${DOMAIN//./\.}[[:space:]]" /etc/chrony/chrony.conf; then
     echo "server ${DOMAIN} iburst prefer" >> /etc/chrony/chrony.conf
     run systemctl restart chrony
@@ -264,7 +314,13 @@ join_domain_once() {
   [[ -n "$COMPUTER_OU" ]] && args+=(--computer-ou="$COMPUTER_OU")
   args+=("$DOMAIN")
   info "Attempting domain join using membership software: $method"
+
+  # Do not allow set -x to print AD_PASSWORD. This protects console, logs, and terminal scrollback.
+  set +x
   printf '%s\n' "$AD_PASSWORD" | "${args[@]}" >>"$LOG_FILE" 2>&1
+  local rc=$?
+  if (( XTRACE_WAS_ON )); then set -x; fi
+  return "$rc"
 }
 
 join_domain() {
@@ -318,9 +374,10 @@ validate_join() {
 }
 
 main() {
-  touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
   parse_args "$@"
   require_root_and_ubuntu
+  initialize_log
+  enable_xtrace_if_requested
   if (( DO_ROLLBACK_ONLY )); then rollback; exit 0; fi
   prompt_if_needed
   create_backup
@@ -330,7 +387,7 @@ main() {
   join_domain
   post_configure
   validate_join
-  info "Success. Log file: $LOG_FILE"
+  info "Success. ${SCRIPT_NAME} version ${SCRIPT_VERSION}. Log file: $LOG_FILE"
 }
 
 main "$@"
