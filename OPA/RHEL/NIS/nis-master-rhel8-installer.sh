@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #===============================================================================
 # nis-master-rhel8-installer.sh
-# Version: 1.1.2
+# Version: 1.1.4
 # Purpose: Install and configure a RHEL 8.x EC2 host as a NIS Master server.
 #
 # Official documentation references:
@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.1.4"
 SCRIPT_NAME="nis-master-rhel8-installer"
 LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 BACKUP_BASE="/var/backups/${SCRIPT_NAME}"
@@ -34,6 +34,7 @@ CONFIGURE_LOCAL_CLIENT="false"
 SKIP_FIREWALL="false"
 SKIP_SELINUX="false"
 SKIP_PACKAGE_INSTALL="false"
+SKIP_PREFLIGHT_CLEANUP="false"
 
 NIS_DOMAIN=""
 MASTER_FQDN=""
@@ -50,7 +51,7 @@ FIREWALL_PORT_END="951"
 REQUIRED_PACKAGES=(ypserv ypbind yp-tools rpcbind make)
 SERVICES_TO_ENABLE=(rpcbind nis-domainname ypserv ypxfrd yppasswdd)
 LOCAL_CLIENT_SERVICES=(ypbind)
-BACKUP_FILES=(/etc/hosts /etc/sysconfig/network /etc/sysconfig/ypserv /etc/sysconfig/ypxfrd /etc/sysconfig/yppasswdd /var/yp/securenets /etc/yp.conf /etc/nsswitch.conf /etc/authselect/user-nsswitch.conf)
+BACKUP_FILES=(/etc/hosts /etc/sysconfig/network /etc/sysconfig/ypserv /etc/sysconfig/ypxfrd /etc/sysconfig/yppasswdd /etc/systemd/system/ypserv.service.d/override.conf /etc/systemd/system/ypxfrd.service.d/override.conf /var/yp/securenets /etc/yp.conf /etc/nsswitch.conf /etc/authselect/user-nsswitch.conf)
 
 PREVIOUS_SERVICE_STATES_FILE=""
 PREVIOUS_AUTHSELECT_FILE=""
@@ -90,6 +91,7 @@ Options:
   --skip-firewall                Do not modify firewalld.
   --skip-selinux                 Do not modify SELinux booleans.
   --skip-package-install         Only validate packages. Do not install missing packages.
+  --skip-preflight-cleanup       Do not run systemd reset/reload cleanup before configuration.
   --dry-run                      Print actions without changing the system.
   --non-interactive              Do not prompt. Required values must be passed as flags or env vars.
   --yes                          Assume yes for confirmation prompts.
@@ -189,6 +191,8 @@ rollback() {
       authselect apply-changes >>"$LOG_FILE" 2>&1 || true
     fi
   fi
+  rmdir /etc/systemd/system/ypserv.service.d /etc/systemd/system/ypxfrd.service.d 2>/dev/null || true
+  systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
   warn "Rollback completed. Installed packages are not removed automatically."
 }
 
@@ -221,6 +225,7 @@ parse_args() {
       --skip-firewall) SKIP_FIREWALL="true"; shift ;;
       --skip-selinux) SKIP_SELINUX="true"; shift ;;
       --skip-package-install) SKIP_PACKAGE_INSTALL="true"; shift ;;
+      --skip-preflight-cleanup) SKIP_PREFLIGHT_CLEANUP="true"; shift ;;
       --dry-run) DRY_RUN="true"; shift ;;
       --non-interactive) NON_INTERACTIVE="true"; shift ;;
       --yes) ASSUME_YES="true"; shift ;;
@@ -418,6 +423,37 @@ check_packages() {
   run_cmd dnf install -y "${missing[@]}"
 }
 
+preflight_cleanup() {
+  if [[ "$SKIP_PREFLIGHT_CLEANUP" == "true" ]]; then
+    info "Skipping preflight cleanup."
+    return 0
+  fi
+
+  info "Running preflight cleanup for prior failed NIS/systemd attempts."
+
+  # Reload systemd so any previous manual or script-created unit changes are
+  # known before this run starts. This is intentionally low risk and does not
+  # stop services on its own.
+  run_cmd systemctl daemon-reload
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    info "DRY-RUN: reset failed states for NIS-related services and restart rpcbind if present."
+    return 0
+  fi
+
+  for svc in rpcbind ypserv ypxfrd yppasswdd ypbind nis-domainname; do
+    if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+      systemctl reset-failed "$svc" >>"$LOG_FILE" 2>&1 || true
+    fi
+  done
+
+  # rpcbind owns RPC program registration. Restarting it before NIS services are
+  # started helps clear stale state from a failed installation attempt.
+  if systemctl list-unit-files rpcbind.service >/dev/null 2>&1; then
+    systemctl restart rpcbind >>"$LOG_FILE" 2>&1 || warn "rpcbind restart failed during preflight cleanup; continuing because service validation will run later."
+  fi
+}
+
 set_kv_file() {
   local file="$1" key="$2" value="$3"
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -474,7 +510,12 @@ configure_hostname_and_hosts() {
 configure_nis_domain_and_ports() {
   run_cmd ypdomainname "$NIS_DOMAIN"
   # RHEL still uses /etc/sysconfig/network for the persistent NIS domain.
+  # Some ypserv packages also read YPSERV_ARGS and YPXFRD_ARGS from this file,
+  # so keep these values here as a compatibility path in addition to the
+  # service-specific sysconfig files below.
   set_kv_file /etc/sysconfig/network NISDOMAIN "$NIS_DOMAIN"
+  set_kv_file /etc/sysconfig/network YPSERV_ARGS "\"-p ${YPSERV_PORT}\""
+  set_kv_file /etc/sysconfig/network YPXFRD_ARGS "\"-p ${YPXFRD_PORT}\""
 
   if [[ "$DRY_RUN" == "true" ]]; then
     info "DRY-RUN: write service-specific sysconfig files for ypserv, ypxfrd, and yppasswdd"
@@ -494,25 +535,51 @@ EOF
   fi
 }
 
-validate_service_environment_files() {
+configure_systemd_port_pinning_guards() {
   if [[ "$DRY_RUN" == "true" ]]; then
-    info "DRY-RUN: skip systemd EnvironmentFile validation."
+    info "DRY-RUN: inspect systemd units and create port-pinning drop-ins if needed."
     return 0
   fi
 
-  # Production guardrail: warn if the packaged service units do not reference
-  # the expected service-specific sysconfig files or variables. Runtime port
-  # validation after service start is still authoritative.
-  if systemctl cat ypserv 2>/dev/null | grep -Eq '/etc/sysconfig/ypserv|YPSERV_ARGS'; then
+  local ypserv_bin ypxfrd_bin dropins_created="false"
+  ypserv_bin="$(command -v ypserv || true)"
+  ypxfrd_bin="$(command -v ypxfrd || true)"
+  [[ -n "$ypserv_bin" ]] || ypserv_bin="/usr/sbin/ypserv"
+  [[ -n "$ypxfrd_bin" ]] || ypxfrd_bin="/usr/sbin/ypxfrd"
+
+  # If the packaged units do not visibly consume the argument variables, add
+  # systemd drop-ins. Files under /etc/systemd/system override package units,
+  # which keeps the change explicit and reversible.
+  if systemctl cat ypserv 2>/dev/null | grep -Eq 'YPSERV_ARGS|/etc/sysconfig/(network|ypserv)'; then
     info "ypserv unit appears to support pinned arguments from sysconfig."
   else
-    warn "ypserv unit does not visibly reference /etc/sysconfig/ypserv or YPSERV_ARGS. Runtime validation will confirm port binding."
+    warn "ypserv unit does not visibly consume YPSERV_ARGS. Creating systemd drop-in to force port ${YPSERV_PORT}."
+    mkdir -p /etc/systemd/system/ypserv.service.d
+    cat > /etc/systemd/system/ypserv.service.d/override.conf <<EOF
+# Managed by ${SCRIPT_NAME} v${SCRIPT_VERSION}
+[Service]
+ExecStart=
+ExecStart=${ypserv_bin} -p ${YPSERV_PORT}
+EOF
+    dropins_created="true"
   fi
 
-  if systemctl cat ypxfrd 2>/dev/null | grep -Eq '/etc/sysconfig/ypxfrd|YPXFRD_ARGS'; then
+  if systemctl cat ypxfrd 2>/dev/null | grep -Eq 'YPXFRD_ARGS|/etc/sysconfig/(network|ypxfrd)'; then
     info "ypxfrd unit appears to support pinned arguments from sysconfig."
   else
-    warn "ypxfrd unit does not visibly reference /etc/sysconfig/ypxfrd or YPXFRD_ARGS. Runtime validation will confirm port binding."
+    warn "ypxfrd unit does not visibly consume YPXFRD_ARGS. Creating systemd drop-in to force port ${YPXFRD_PORT}."
+    mkdir -p /etc/systemd/system/ypxfrd.service.d
+    cat > /etc/systemd/system/ypxfrd.service.d/override.conf <<EOF
+# Managed by ${SCRIPT_NAME} v${SCRIPT_VERSION}
+[Service]
+ExecStart=
+ExecStart=${ypxfrd_bin} -p ${YPXFRD_PORT}
+EOF
+    dropins_created="true"
+  fi
+
+  if [[ "$dropins_created" == "true" ]]; then
+    run_cmd systemctl daemon-reload
   fi
 }
 
@@ -627,7 +694,7 @@ validate_runtime() {
   if ! rpcinfo -p localhost | awk -v p="$YPSERV_PORT" '($3 == "tcp" || $3 == "udp") && $4 == p && $5 == "ypserv" { found=1 } END { exit(found ? 0 : 1) }'; then
     fail "ypserv does not appear to be bound to the requested pinned port ${YPSERV_PORT}. Check systemd unit EnvironmentFile handling."
   fi
-  if ! rpcinfo -p localhost | awk -v p="$YPXFRD_PORT" '($3 == "tcp" || $3 == "udp") && $4 == p && $5 == "ypxfrd" { found=1 } END { exit(found ? 0 : 1) }'; then
+  if ! rpcinfo -p localhost | awk -v p="$YPXFRD_PORT" '($3 == "tcp" || $3 == "udp") && $4 == p && ($5 == "ypxfrd" || $5 == "fypxfrd") { found=1 } END { exit(found ? 0 : 1) }'; then
     fail "ypxfrd does not appear to be bound to the requested pinned port ${YPXFRD_PORT}. Check systemd unit EnvironmentFile handling."
   fi
   [[ -d "/var/yp/${NIS_DOMAIN}" ]] || fail "Expected map directory /var/yp/${NIS_DOMAIN} was not created."
@@ -674,6 +741,7 @@ Configuration summary:
   ypxfrd port:             ${YPXFRD_PORT}
   yppasswdd port:          ${YPPASSWDD_PORT}
   Dry run:                 ${DRY_RUN}
+  Preflight cleanup:       $([[ "$SKIP_PREFLIGHT_CLEANUP" == "true" ]] && echo disabled || echo enabled)
   Rollback on error:       ${ROLLBACK_ON_ERROR}
 
 SUMMARY
@@ -682,9 +750,10 @@ SUMMARY
 
   prepare_logging_and_backup
   check_packages
+  preflight_cleanup
   configure_hostname_and_hosts
   configure_nis_domain_and_ports
-  validate_service_environment_files
+  configure_systemd_port_pinning_guards
   configure_securenets
   configure_selinux
   configure_firewall

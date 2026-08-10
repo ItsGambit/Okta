@@ -1,6 +1,6 @@
 # RHEL 8.10 EC2 NIS Master Installer
 
-**Version:** 1.1.2  
+**Version:** 1.1.4  
 **Script:** `nis-master-rhel8-installer.sh`
 
 This package installs and configures an Amazon EC2 instance running RHEL 8.x, including RHEL 8.10, as a **NIS Master server** using `ypserv`, `ypbind`, `yp-tools`, `rpcbind`, and `make`.
@@ -247,6 +247,7 @@ The log includes commands run, validation status, backup location, and any error
 --skip-firewall                Do not modify firewalld.
 --skip-selinux                 Do not modify SELinux booleans.
 --skip-package-install         Only validate packages. Do not install missing packages.
+--skip-preflight-cleanup       Do not run systemd reset/reload cleanup before configuration.
 --dry-run                      Print actions without changing the system.
 --non-interactive              Do not prompt. Required values must be passed as flags or environment variables.
 --yes                          Assume yes for confirmation prompts.
@@ -311,3 +312,18 @@ It was also reviewed for common safety issues:
 - Replaced regex-based `/etc/hosts` edits with an `awk` update that matches exact fields instead of unescaped dotted hostnames/IPs.
 - Added explicit option-value validation for flags such as `--master-ip` and `--allowed-cidr`.
 - Tightened `rpcinfo` pinned-port validation to match the expected RPC service name as well as the port.
+
+
+### 1.1.3
+
+- Writes `YPSERV_ARGS` and `YPXFRD_ARGS` to `/etc/sysconfig/network` as a compatibility path while still writing service-specific sysconfig files.
+- Adds systemd drop-ins for `ypserv` and `ypxfrd` if the packaged unit files do not visibly consume the expected sysconfig variables.
+- Accepts both `ypxfrd` and `fypxfrd` as valid RPC service names during pinned-port validation.
+- Includes rollback cleanup for generated systemd drop-in files and reloads systemd after rollback.
+
+
+### 1.1.4
+
+- Added a preflight cleanup step that runs after package validation/install and before configuration changes.
+- The cleanup runs `systemctl daemon-reload`, resets failed states for NIS-related services, and restarts `rpcbind` if present to clear stale RPC state from a previous failed run.
+- Added `--skip-preflight-cleanup` for environments where restarting `rpcbind` must be controlled separately.
