@@ -1,0 +1,36 @@
+# Credentials -- never committed, see README "Security: encrypted credential storage"
+.env
+environments.json
+TestCreds.txt
+
+# Locally-preserved Secrets Access Dashboard System Log history (opt-in,
+# see the "preserve logs locally" setting) -- audit metadata, not a
+# credential, but still local-machine-only state that shouldn't be committed
+secrets_log_cache.json
+
+# This tool's own write-action audit trail (see engine.log_audit_event) --
+# real operational data (who did what, when) specific to whichever
+# deployment produced it, not something to ship in the repo
+audit_log.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# This tool's own output
+folders_result_*.csv
+
+# Frontend build/deps (frontend/.gitignore also covers these for that subtree;
+# listed here too so a root-level `git status` never shows them as untracked)
+frontend/node_modules/
+frontend/dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
