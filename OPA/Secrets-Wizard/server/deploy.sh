@@ -56,6 +56,9 @@ rsync -a --delete \
   --exclude 'banner_config.json' \
   --exclude 'audit_log.jsonl' \
   --exclude 'secrets_log_cache.json' \
+  --exclude 'audit_store.db' \
+  --exclude 'audit_store.db-wal' \
+  --exclude 'audit_store.db-shm' \
   --exclude '.env' \
   "$SRC/" "$APP_DIR/"
 
